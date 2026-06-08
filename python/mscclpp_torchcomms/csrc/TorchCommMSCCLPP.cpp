@@ -215,6 +215,12 @@ void TorchCommMSCCLPP::init(at::Device device, const std::string& name, const Co
   event_pool_ = std::make_shared<MscclppGpuEventPool>(256);
   nccl_ = NcclFallback::tryCreate(comm_, rank_, size_);
 
+  // R2: cache the trace flag once instead of calling std::getenv() on every
+  // collective dispatch. The env var isn't designed to be runtime-toggleable.
+  if (const char* v = std::getenv("MSCCLPP_TORCHCOMMS_TRACE"); v && v[0] && std::string(v) != "0") {
+    trace_ = true;
+  }
+
   initialized_ = true;
 }
 
@@ -238,6 +244,7 @@ void TorchCommMSCCLPP::finalize() {
   scratchBuffer_.reset();
   flagBuffer_.reset();
   comm_.reset();
+  selectionCache_.clear();  // R3: cached entries become stale on finalize
   initialized_ = false;
 }
 
@@ -293,13 +300,38 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::executeCollective(const std::str
                                                                   mscclpp::DataType dtype, mscclpp::ReduceOp reduceOp,
                                                                   bool async_op, std::chrono::milliseconds timeout) {
   cudaStream_t stream = getOperationStream(async_op);
-  mscclpp::CollectiveRequest request{size_,     nRanksPerNode_, rank_,      sendbuf, recvbuf,
-                                     sendBytes, stream,         collective, dtype,   {}};
 
-  auto algo = algorithmCollection_.selectAlgorithm(request);
+  // R3: cache the (collective, size-bucket) -> algo lookup. selectAlgorithm()
+  // walks the algo map and runs the topology-aware selector; for steady-state
+  // FSDP2 the same (collective, size) tuple repeats hundreds of times per
+  // epoch, so caching turns ~1-5us of map walking into a hash lookup.
+  // sizeBucket is log2(sendBytes) so small variations within a 2x range share
+  // the same cache entry — the selector's thresholds are all power-of-2 anyway.
+  int sizeBucket = sendBytes ? 63 - __builtin_clzll(static_cast<unsigned long long>(sendBytes | 1)) : -1;
+  // For now no AlgorithmSelectorConfig bits are runtime-variable in our
+  // backend (symmetricMemory=false hardcoded, isCuMemMapAllocated detected
+  // per-call inside selectAlgorithm), so configBits is always 0. When R1
+  // lands and we start passing real symmetricMemory through, encode it here.
+  AlgoSelectionKey key{collective, sizeBucket, 0};
+  std::shared_ptr<mscclpp::Algorithm> algo;
+  if (auto it = selectionCache_.find(key); it != selectionCache_.end()) {
+    algo = it->second;
+  } else {
+    mscclpp::CollectiveRequest request{size_,     nRanksPerNode_, rank_,      sendbuf, recvbuf,
+                                       sendBytes, stream,         collective, dtype,   {}};
+    algo = algorithmCollection_.selectAlgorithm(request);
+    if (algo) selectionCache_.emplace(key, algo);
+  }
   if (!algo) {
     throw std::runtime_error("[TorchCommMSCCLPP] no algorithm registered for '" + collective +
                              "' size=" + std::to_string(sendBytes));
+  }
+  // R2: use cached trace_ flag instead of std::getenv on every call.
+  if (trace_) {
+    const char* atype = (algo->type() == mscclpp::AlgorithmType::Native) ? "NATIVE" : "DSL";
+    std::cerr << "[MSCCLPP] rank=" << rank_ << " collective=" << collective << " bytes=" << sendBytes
+              << " dtype=" << static_cast<int>(dtype) << " -> algo='" << algo->name() << "' (" << atype << ")"
+              << std::endl;
   }
   return runAlgorithm(algo, sendbuf, recvbuf, sendBytes, recvBytes, dtype, reduceOp, stream, timeout);
 }
@@ -349,20 +381,32 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::reduce_scatter_single(at::Tensor
   const auto mscclppDtype = torchDtypeToMscclpp(dtype);
   cudaStream_t stream = getOperationStream(async_op);
 
-  mscclpp::CollectiveRequest request{size_,
-                                     nRanksPerNode_,
-                                     rank_,
-                                     input.data_ptr(),
-                                     output.data_ptr(),
-                                     static_cast<size_t>(input.nbytes()),
-                                     stream,
-                                     "reducescatter",
-                                     mscclppDtype,
-                                     {}};
-  auto mscclppOp = torchReduceOpToMscclpp(op);
-  auto algo = mscclppOp ? algorithmCollection_.selectAlgorithm(request) : nullptr;
+  std::shared_ptr<mscclpp::Algorithm> algo;
+  std::optional<mscclpp::ReduceOp> mscclppOp;
+  if (mscclppDtype) {
+    mscclppOp = torchReduceOpToMscclpp(op);
+    if (mscclppOp) {
+      mscclpp::CollectiveRequest request{size_,
+                                         nRanksPerNode_,
+                                         rank_,
+                                         input.data_ptr(),
+                                         output.data_ptr(),
+                                         static_cast<size_t>(input.nbytes()),
+                                         stream,
+                                         "reducescatter",
+                                         *mscclppDtype,
+                                         {}};
+      algo = algorithmCollection_.selectAlgorithm(request);
+    }
+  }
   if (algo) {
-    return runAlgorithm(algo, input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(), mscclppDtype,
+    if (trace_) {  // R2: cached at init
+      const char* atype = (algo->type() == mscclpp::AlgorithmType::Native) ? "NATIVE" : "DSL";
+      std::cerr << "[MSCCLPP] rank=" << rank_ << " collective=reducescatter bytes=" << input.nbytes()
+                << " dtype=" << static_cast<int>(*mscclppDtype) << " -> algo='" << algo->name() << "' (" << atype
+                << ")" << std::endl;
+    }
+    return runAlgorithm(algo, input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(), *mscclppDtype,
                         *mscclppOp, stream, options.timeout);
   }
   return ncclFallback("reduce_scatter_single", stream, options.timeout, [&] {

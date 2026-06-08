@@ -205,6 +205,44 @@ class TorchCommMSCCLPP : public TorchCommBackend, public std::enable_shared_from
   /// implement (reduce_scatter, broadcast, barrier on certain configs). Null
   /// if libnccl couldn't be loaded — those collectives then throw.
   std::unique_ptr<class NcclFallback> nccl_;
+
+  /// R2: cached value of the MSCCLPP_TORCHCOMMS_TRACE env var, read once at
+  /// init() time. Avoids calling std::getenv on every collective dispatch
+  /// (~50-200 ns × 2000+ calls/epoch on FSDP2 workloads). The env var is
+  /// not designed to be runtime-toggleable, so a one-shot read at init is
+  /// the right semantics. Set MSCCLPP_TORCHCOMMS_TRACE to any non-"0"
+  /// non-empty value to enable.
+  bool trace_ = false;
+
+  /// R3: per-comm cache of (collective, message-size-bucket) → algorithm.
+  ///
+  /// selectAlgorithm() walks the AlgorithmCollection's algoMapByCollective_,
+  /// runs the registered selector function, and returns the chosen Algorithm.
+  /// For steady-state FSDP2 training the selector inputs (collective name,
+  /// message size, topology) are mostly stable across calls — the same
+  /// (collective, log2(size)) tuple repeats hundreds of times per epoch.
+  /// Caching the lookup turns selectAlgorithm() from ~1-5 µs of map-walking
+  /// into a single hash lookup on the hot path.
+  ///
+  /// Cache key intentionally coarse: log2(messageSize) bucket plus the bits
+  /// of AlgorithmSelectorConfig that actually steer the selector
+  /// (symmetricMemory, isCuMemMapAllocated, ncclDlopenSharedLib). Lifetime
+  /// matches the AlgorithmCollection itself — torn down by finalize().
+  struct AlgoSelectionKey {
+    std::string collective;
+    int sizeBucket;
+    uint8_t configBits;
+    bool operator==(const AlgoSelectionKey& other) const {
+      return collective == other.collective && sizeBucket == other.sizeBucket && configBits == other.configBits;
+    }
+  };
+  struct AlgoSelectionKeyHash {
+    size_t operator()(const AlgoSelectionKey& k) const noexcept {
+      return std::hash<std::string>{}(k.collective) ^ (static_cast<size_t>(k.sizeBucket) << 16) ^
+             (static_cast<size_t>(k.configBits) << 24);
+    }
+  };
+  std::unordered_map<AlgoSelectionKey, std::shared_ptr<mscclpp::Algorithm>, AlgoSelectionKeyHash> selectionCache_;
 };
 
 }  // namespace torch::comms
