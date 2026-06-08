@@ -111,12 +111,12 @@ $ CXX=/opt/rocm/bin/hipcc python -m pip install ".[rocm6]"
 ```
 
 > **Note:** A platform extra (`cuda11`, `cuda12`, `cuda13`, or `rocm6`) is required to install CuPy.
-> The CUDA extras install pre-built CuPy wheels. The `rocm6` extra installs CuPy from source,
-> which requires ROCm and may take longer. Running `pip install .` without an extra will not install CuPy.
+> The CUDA extras install pre-built CuPy wheels and CUDA Python bindings. The `rocm6` extra installs CuPy from source
+> and HIP Python 6.x, which require ROCm and may take longer. Running `pip install .` without an extra will not install CuPy.
 
 Optional extras can be installed by specifying them in brackets. Available extras:
-- **`cuda11`**, **`cuda12`**, **`cuda13`**: Install a pre-built CuPy package for your CUDA version.
-- **`rocm6`**: Install CuPy from source for AMD ROCm platforms.
+- **`cuda11`**, **`cuda12`**, **`cuda13`**: Install a pre-built CuPy package and CUDA Python bindings for your CUDA version.
+- **`rocm6`**: Install CuPy from source and HIP Python 6.x for AMD ROCm platforms.
 - **`benchmark`**: Install benchmark dependencies (mpi4py, prettytable, netifaces, matplotlib).
 - **`test`**: Install test dependencies (pytest, mpi4py, netifaces).
 
@@ -125,6 +125,45 @@ Optional extras can be installed by specifying them in brackets. Available extra
 $ python -m pip install ".[cuda12,benchmark]"
 # Example: install with all extras for testing on CUDA 12
 $ python -m pip install ".[cuda12,benchmark,test]"
+```
+
+(mrc-support)=
+## MRC Support
+
+MSCCL++ supports execution over **Multi-path Reliable Connection (MRC)**, which enables the use of multiple network paths to improve bandwidth utilization and resilience.
+
+To enable MRC support, you must configure both the **build-time** and **runtime** environments as described below.
+
+---
+
+### 1. Install MRC Verbs Shim
+
+MSCCL++ relies on a custom verbs shim library that intercepts standard `libibverbs` calls and redirects them to an MRC-enabled implementation.
+
+- Install the [MRC verbs shim library](https://github.com/microsoft/mrc-verbs-shim-lib) on all nodes in the cluster.
+- Ensure that the underlying system has MRC support enabled.
+
+---
+
+### 2. Build MSCCL++ with MRC Enabled
+
+Enable MRC support during the build by adding the following CMake option:
+
+```bash
+-DMSCCLPP_USE_MRC=ON
+```
+
+This configures MSCCL++ to use the MRC-enabled verbs layer at runtime.
+
+### 3. Configure Runtime Environment
+
+At runtime, you must configure environment variables to override the default RDMA libraries and link against the MRC-enabled stack:
+
+```bash
+-x MSCCLPP_IBV_SO=:$MRC-SHIM-HOME/libibverbs.so
+-x LD_LIBRARY_PATH=$MRC-SHIM-HOME/mrc-header-lib:$LD_LIBRARY_PATH
+-x VMRC_LIBMRC_SO=/opt/mellanox/doca/lib/aarch64-linux-gnu/libnv_mrc.so"
+-x VMRC_LIBIBVERBS_SO=/lib/aarch64-linux-gnu/libibverbs.so.1
 ```
 
 (vscode-dev-container)=
@@ -171,15 +210,37 @@ $ mpirun -np 16 -npernode 8 -hostfile hostfile ./bin/mp_unit_tests -ip_port 10.0
 
 ## Performance Benchmark
 
-### Python Benchmark
+### Python Benchmark and Tuning
 
-[Install the MSCCL++ Python package](#install-from-source-python-module) and run our Python AllReduce benchmark as follows. It requires MPI on the system.
+[Install the MSCCL++ Python package](#install-from-source-python-module) and run the Python collective benchmark as follows. It requires MPI on the system.
 
 ```bash
 # Install with benchmark dependencies and the appropriate CUDA/ROCm extras.
 # Replace `cuda12` with your platform: cuda11, cuda12, cuda13, or rocm6.
 $ python3 -m pip install ".[cuda12,benchmark,test]"
-$ mpirun -tag-output -np 8 python3 ./python/mscclpp_benchmark/allreduce_bench.py
+
+```
+
+To autotune launch parameters and save a tuned config:
+
+```bash
+$ PYTHONPATH=$PWD/python mpirun -np 8 --allow-run-as-root \
+    python3 -m mscclpp_benchmark.bench_collective \
+    --collective allreduce \
+    --dtype float16 \
+    --batch-sizes 1,2,4,8 \
+    --autotune \
+    --write-config /tmp/mscclpp_tuned_configs.json
+```
+
+Use the tuned config in a benchmark:
+
+```bash
+$ PYTHONPATH=$PWD/python mpirun -np 8 --allow-run-as-root \
+    python3 -m mscclpp_benchmark.bench_collective \
+    --collective allreduce \
+    --dtype float16 \
+    --config-path /tmp/mscclpp_tuned_configs.json
 ```
 
 (nccl-benchmark)=
@@ -273,4 +334,3 @@ Version: 0.8.0.post1.dev0+gc632fee37.d20251007
 mscclpp.version
 {'version': '0.8.0.post1.dev0+gc632fee37.d20251007', 'git_commit': 'g50382c567'}
 ```
-
