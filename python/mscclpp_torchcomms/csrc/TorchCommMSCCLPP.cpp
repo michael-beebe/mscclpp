@@ -133,7 +133,26 @@ std::shared_ptr<mscclpp::Algorithm> TorchCommMSCCLPP::selectAlgorithm(
   if (request.nRanksPerNode != request.worldSize) {
     return mscclpp::nccl::selectMultiNodeAlgorithm(algoMap, request, config);
   }
-  if (request.collective == "allgather") return mscclpp::nccl::selectSingleNodeAllgather(algoMap, request, config);
+  if (request.collective == "allgather") {
+    // The default selector picks `default_allgather_fullmesh2` for every
+    // allgather <= 32 MiB. fullmesh2's context-key generator returns a unique
+    // key (`tag++`) on every call when symmetric memory is not available,
+    // so the per-buffer context cache misses on every dispatch and we
+    // re-register IPC memory across all peers via TcpBootstrap each time.
+    // For FSDP2-style workloads (thousands of <32 MiB allgathers per epoch)
+    // that registration cost dominates and makes us ~20% slower than NCCL.
+    //
+    // `default_allgather_fullmesh` always returns the same context key
+    // (constant key {nullptr, nullptr, 0, 0, 0}) so its context is set up
+    // once and reused for every subsequent call. Prefer it whenever symmetric
+    // memory is not available; fall through to the default selector when it
+    // is (since fullmesh2 caches correctly in that case).
+    if (!config.symmetricMemory && !config.isCuMemMapAllocated) {
+      auto it = algoMap.find("default_allgather_fullmesh");
+      if (it != algoMap.end()) return it->second;
+    }
+    return mscclpp::nccl::selectSingleNodeAllgather(algoMap, request, config);
+  }
   if (request.collective == "allreduce") return mscclpp::nccl::selectSingleNodeAllreduce(algoMap, request, config);
   return nullptr;
 }
