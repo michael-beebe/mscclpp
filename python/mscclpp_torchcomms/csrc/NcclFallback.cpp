@@ -31,6 +31,7 @@ using CommInitRankFn = ncclResult_t (*)(ncclComm_t*, int, ncclUniqueId, int);
 using CommDestroyFn = ncclResult_t (*)(ncclComm_t);
 using ReduceScatterFn = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t,
                                          cudaStream_t);
+using AllGatherFn = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t, ncclComm_t, cudaStream_t);
 using BroadcastFn = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t, int, ncclComm_t, cudaStream_t);
 using AllReduceFn = ncclResult_t (*)(const void*, void*, size_t, ncclDataType_t, ncclRedOp_t, ncclComm_t, cudaStream_t);
 using ReduceFn =
@@ -51,6 +52,14 @@ ncclDataType_t torchDtypeToNccl(at::ScalarType dtype) {
       return ncclInt32;
     case at::kUInt32:
       return ncclUint32;
+    case at::kLong:
+      return ncclInt64;
+    case at::kDouble:
+      return ncclFloat64;
+    case at::kByte:
+      return ncclUint8;
+    case at::kChar:
+      return ncclInt8;
     default:
       throw std::runtime_error("[NcclFallback] unsupported dtype " + std::string(at::toString(dtype)));
   }
@@ -118,6 +127,7 @@ std::unique_ptr<NcclFallback> NcclFallback::tryCreate(const std::shared_ptr<mscc
   fb->commInitRankFn_ = sym("ncclCommInitRank");
   fb->commDestroyFn_ = sym("ncclCommDestroy");
   fb->reduceScatterFn_ = sym("ncclReduceScatter");
+  fb->allGatherFn_ = sym("ncclAllGather");
   fb->broadcastFn_ = sym("ncclBroadcast");
   fb->allReduceFn_ = sym("ncclAllReduce");
   fb->reduceFn_ = sym("ncclReduce");
@@ -126,6 +136,7 @@ std::unique_ptr<NcclFallback> NcclFallback::tryCreate(const std::shared_ptr<mscc
   fb->groupStartFn_ = sym("ncclGroupStart");
   fb->groupEndFn_ = sym("ncclGroupEnd");
   if (!fb->getUniqueIdFn_ || !fb->commInitRankFn_ || !fb->commDestroyFn_ || !fb->reduceScatterFn_ ||
+      !fb->allGatherFn_ ||
       !fb->broadcastFn_ || !fb->allReduceFn_ || !fb->reduceFn_ || !fb->sendFn_ || !fb->recvFn_ ||
       !fb->groupStartFn_ || !fb->groupEndFn_) {
     return nullptr;  // dtor cleans up dlHandle_
@@ -196,6 +207,13 @@ void NcclFallback::reduceScatter(const void* sendbuf, void* recvbuf, size_t recv
                                             << " op=" << static_cast<int>(torchReduceOpToNccl(op)));
   NCCL_CALL("ncclReduceScatter", ReduceScatterFn, reduceScatterFn_, sendbuf, recvbuf, recvCount,
             torchDtypeToNccl(dtype), torchReduceOpToNccl(op), reinterpret_cast<ncclComm_t>(ncclComm_), stream);
+}
+
+void NcclFallback::allGather(const void* sendbuf, void* recvbuf, size_t sendCount, at::ScalarType dtype,
+                             cudaStream_t stream) {
+  NCCL_TRACE("all_gather", "sendCount=" << sendCount << " dtype=" << static_cast<int>(torchDtypeToNccl(dtype)));
+  NCCL_CALL("ncclAllGather", AllGatherFn, allGatherFn_, sendbuf, recvbuf, sendCount, torchDtypeToNccl(dtype),
+            reinterpret_cast<ncclComm_t>(ncclComm_), stream);
 }
 
 void NcclFallback::broadcast(const void* sendbuf, void* recvbuf, size_t count, at::ScalarType dtype, int root,

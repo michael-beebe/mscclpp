@@ -46,6 +46,9 @@ class NcclFallback {
   void reduceScatter(const void* sendbuf, void* recvbuf, size_t recvCount, at::ScalarType dtype, const ReduceOp& op,
                      cudaStream_t stream);
 
+  /// all_gather: sendcount is the per-rank input element count.
+  void allGather(const void* sendbuf, void* recvbuf, size_t sendCount, at::ScalarType dtype, cudaStream_t stream);
+
   /// broadcast from `root` to all ranks. count is element count.
   void broadcast(const void* sendbuf, void* recvbuf, size_t count, at::ScalarType dtype, int root, cudaStream_t stream);
 
@@ -81,6 +84,7 @@ class NcclFallback {
   void* commInitRankFn_ = nullptr;
   void* commDestroyFn_ = nullptr;
   void* reduceScatterFn_ = nullptr;
+  void* allGatherFn_ = nullptr;
   void* broadcastFn_ = nullptr;
   void* allReduceFn_ = nullptr;
   void* reduceFn_ = nullptr;
