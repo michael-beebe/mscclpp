@@ -22,7 +22,7 @@ namespace torch::comms {
 
 // --- Helpers ---
 
-mscclpp::DataType TorchCommMSCCLPP::torchDtypeToMscclpp(at::ScalarType dtype) {
+std::optional<mscclpp::DataType> TorchCommMSCCLPP::torchDtypeToMscclpp(at::ScalarType dtype) {
   switch (dtype) {
     case at::kFloat:
       return mscclpp::DataType::FLOAT32;
@@ -34,8 +34,10 @@ mscclpp::DataType TorchCommMSCCLPP::torchDtypeToMscclpp(at::ScalarType dtype) {
       return mscclpp::DataType::INT32;
     case at::kUInt32:
       return mscclpp::DataType::UINT32;
+    case at::kByte:
+      return mscclpp::DataType::UINT8;
     default:
-      throw std::runtime_error("[TorchCommMSCCLPP] unsupported dtype: " + std::string(at::toString(dtype)));
+      return std::nullopt;  // Long, Double, Char, etc. -> NcclFallback
   }
 }
 
@@ -340,9 +342,11 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::all_reduce(at::Tensor& tensor, c
                                                            const AllReduceOptions& options) {
   checkInitialized();
   TORCH_CHECK(tensor.is_contiguous(), "[TorchCommMSCCLPP] all_reduce requires contiguous tensor");
-  if (auto mscclppOp = torchReduceOpToMscclpp(op)) {
+  auto mscclppDtype = torchDtypeToMscclpp(tensor.scalar_type());
+  auto mscclppOp = torchReduceOpToMscclpp(op);
+  if (mscclppDtype && mscclppOp) {
     return executeCollective("allreduce", tensor.data_ptr(), tensor.data_ptr(), tensor.nbytes(), tensor.nbytes(),
-                             torchDtypeToMscclpp(tensor.scalar_type()), *mscclppOp, async_op, options.timeout);
+                             *mscclppDtype, *mscclppOp, async_op, options.timeout);
   }
   cudaStream_t stream = getOperationStream(async_op);
   return ncclFallback("all_reduce", stream, options.timeout, [&] {
@@ -356,8 +360,15 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::all_gather_single(at::Tensor& ou
   checkInitialized();
   TORCH_CHECK(input.is_contiguous() && output.is_contiguous(),
               "[TorchCommMSCCLPP] all_gather_single requires contiguous tensors");
-  return executeCollective("allgather", input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(),
-                           torchDtypeToMscclpp(input.scalar_type()), mscclpp::NOP, async_op, options.timeout);
+  if (auto mscclppDtype = torchDtypeToMscclpp(input.scalar_type())) {
+    return executeCollective("allgather", input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(),
+                             *mscclppDtype, mscclpp::NOP, async_op, options.timeout);
+  }
+  // Dtype not native to MSCCL++ — fall back to NCCL.
+  cudaStream_t stream = getOperationStream(async_op);
+  return ncclFallback("all_gather_single", stream, options.timeout, [&] {
+    nccl_->allGather(input.data_ptr(), output.data_ptr(), input.numel(), input.scalar_type(), stream);
+  });
 }
 
 c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::all_to_all_single(at::Tensor& output, const at::Tensor& input,
@@ -365,8 +376,17 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::all_to_all_single(at::Tensor& ou
   checkInitialized();
   TORCH_CHECK(input.is_contiguous() && output.is_contiguous(),
               "[TorchCommMSCCLPP] all_to_all_single requires contiguous tensors");
-  return executeCollective("alltoall", input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(),
-                           torchDtypeToMscclpp(input.scalar_type()), mscclpp::NOP, async_op, options.timeout);
+  if (auto mscclppDtype = torchDtypeToMscclpp(input.scalar_type())) {
+    return executeCollective("alltoall", input.data_ptr(), output.data_ptr(), input.nbytes(), output.nbytes(),
+                             *mscclppDtype, mscclpp::NOP, async_op, options.timeout);
+  }
+  // Dtype not native to MSCCL++. NCCL has no top-level all_to_all; emulate as
+  // an all_to_all_v_single with equal split sizes.
+  const size_t per_rank = static_cast<size_t>(input.numel()) / static_cast<size_t>(size_);
+  std::vector<uint64_t> splits(size_, per_rank);
+  AllToAllvSingleOptions vopts;
+  vopts.timeout = options.timeout;
+  return all_to_all_v_single(output, input, splits, splits, async_op, vopts);
 }
 
 // reduce_scatter: try MSCCL++ first; fall back to NCCL if no native algorithm.

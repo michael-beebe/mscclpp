@@ -113,8 +113,10 @@ class TorchCommMSCCLPP : public TorchCommBackend, public std::enable_shared_from
  private:
   void checkInitialized() const;
 
-  /// Map PyTorch scalar type to MSCCL++ DataType.
-  static mscclpp::DataType torchDtypeToMscclpp(at::ScalarType dtype);
+  /// Map PyTorch scalar type to MSCCL++ DataType. Returns nullopt for any
+  /// dtype MSCCL++ doesn't natively support (e.g. int64, float64, byte) so
+  /// the caller can route to NCCL fallback instead of throwing.
+  static std::optional<mscclpp::DataType> torchDtypeToMscclpp(at::ScalarType dtype);
 
   /// Map TorchComms ReduceOp to MSCCL++ ReduceOp. Returns std::nullopt for
   /// ops MSCCL++ kernels do not implement (MAX, PRODUCT, ...); callers route
