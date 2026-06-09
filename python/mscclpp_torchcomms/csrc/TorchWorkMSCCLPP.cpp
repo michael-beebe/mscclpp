@@ -69,68 +69,42 @@ void MscclppGpuEventPool::release(cudaEvent_t event) {
 //
 // This matches the TorchWorkNCCL pattern in the torchcomms NCCL backend.
 
-// Acquires two events from the pool: one for start, one for end.
-// Events are returned to the pool in the destructor.
+// Acquires one event from the pool. Returned to the pool in the destructor.
 TorchWorkMSCCLPP::TorchWorkMSCCLPP(cudaStream_t op_stream, int device_index, std::chrono::milliseconds timeout_ms,
                                    std::shared_ptr<MscclppGpuEventPool> event_pool)
-    : op_stream_(op_stream), device_index_(device_index), timeout_ms_(timeout_ms), event_pool_(std::move(event_pool)) {
-  start_event_ = event_pool_->acquire();
+    : op_stream_(op_stream),
+      device_index_(device_index),
+      timeout_ms_(timeout_ms),
+      event_pool_(std::move(event_pool)),
+      construct_time_(std::chrono::steady_clock::now()) {
   end_event_ = event_pool_->acquire();
 }
 
-TorchWorkMSCCLPP::~TorchWorkMSCCLPP() {
-  event_pool_->release(start_event_);
-  event_pool_->release(end_event_);
-}
-
-// Records a GPU event on the operation stream BEFORE the collective kernel
-// is launched. Used by checkStatus() to detect when the GPU actually starts
-// executing (as opposed to sitting in the stream queue).
-void TorchWorkMSCCLPP::recordStart() { MSCCLPP_CUDATHROW(cudaEventRecord(start_event_, op_stream_)); }
+TorchWorkMSCCLPP::~TorchWorkMSCCLPP() { event_pool_->release(end_event_); }
 
 // Records a GPU event on the operation stream AFTER the collective kernel
 // is launched. wait() and checkStatus() use this event to determine when
 // the collective has finished.
 void TorchWorkMSCCLPP::recordEnd() { MSCCLPP_CUDATHROW(cudaEventRecord(end_event_, op_stream_)); }
 
-// Polls GPU events without blocking. Tracks a two-phase state machine:
-//   NOT_STARTED -> INPROGRESS (start_event_ done) -> COMPLETED (end_event_ done)
-// Also enforces timeout: if end_event_ hasn't fired within timeout_ms_ after
-// start_event_ fired, the status moves to TIMEDOUT.
+// Polls the end event without blocking, enforces wall-clock timeout.
 TorchWork::WorkStatus TorchWorkMSCCLPP::checkStatus() {
   if (status() == WorkStatus::COMPLETED || status() == WorkStatus::ERROR || status() == WorkStatus::TIMEDOUT) {
     return status();
   }
-
-  // Step 1: query start event to establish when the GPU began executing
-  if (!start_completed_time_.has_value()) {
-    cudaError_t start_status = cudaEventQuery(start_event_);
-    if (start_status == cudaSuccess) {
-      start_completed_time_ = std::chrono::steady_clock::now();
-      setStatus(WorkStatus::INPROGRESS);
-    } else if (start_status != cudaErrorNotReady) {
-      setStatus(WorkStatus::ERROR);
-      return status();
-    }
-  }
-  if (status() == WorkStatus::NOT_STARTED || status() == WorkStatus::ERROR) {
-    return status();
-  }
-
-  // Step 2: start event done — now query end event
   cudaError_t end_status = cudaEventQuery(end_event_);
   if (end_status == cudaSuccess) {
     setStatus(WorkStatus::COMPLETED);
   } else if (end_status == cudaErrorNotReady) {
+    setStatus(WorkStatus::INPROGRESS);
     auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() -
-                                                                         start_completed_time_.value());
+                                                                         construct_time_);
     if (elapsed > timeout_ms_) {
       setStatus(WorkStatus::TIMEDOUT);
     }
   } else {
     setStatus(WorkStatus::ERROR);
   }
-
   return status();
 }
 

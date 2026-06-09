@@ -39,11 +39,18 @@ class MscclppGpuEventPool {
 
 /// GPU event-based async work handle for MSCCL++ operations.
 ///
-/// Follows TorchWorkNCCL pattern:
-///   - recordStart() / recordEnd() bracket the MSCCL++ executor call
-///   - wait() issues cudaStreamWaitEvent on the caller's current stream
-///     (GPU-side, no CPU blocking)
-///   - checkStatus() polls events and enforces timeout
+/// Records a single end-of-collective event on the operation stream. wait()
+/// inserts a cudaStreamWaitEvent on the caller's current stream (GPU-side,
+/// no CPU blocking). checkStatus() polls the end event and enforces a
+/// CPU-side wall-clock timeout (the start reference is captured at
+/// construction, no GPU sync required).
+///
+/// We deliberately do NOT record a start event — every cudaEventRecord
+/// is 2-5us of driver time, and the start event was only consulted by
+/// checkStatus() for timeout-window measurement. Wall-clock from
+/// construction is a good enough timeout reference and avoids per-call
+/// driver overhead, which matters in FSDP2 where each step issues
+/// dozens of collectives.
 class TorchWorkMSCCLPP : public TorchWork {
  public:
   TorchWorkMSCCLPP(cudaStream_t op_stream, int device_index, std::chrono::milliseconds timeout_ms,
@@ -56,8 +63,8 @@ class TorchWorkMSCCLPP : public TorchWork {
   void wait() override;
   std::chrono::milliseconds getTimeout() const override { return timeout_ms_; }
 
-  /// Record start event on op_stream_ before launching the collective.
-  void recordStart();
+  /// No-op kept for backward-compat with existing call sites.
+  void recordStart() {}
 
   /// Record end event on op_stream_ after launching the collective.
   void recordEnd();
@@ -65,13 +72,12 @@ class TorchWorkMSCCLPP : public TorchWork {
  private:
   WorkStatus checkStatus();
 
-  cudaEvent_t start_event_;
   cudaEvent_t end_event_;
   cudaStream_t op_stream_;  // not owned
   int device_index_;
   std::chrono::milliseconds timeout_ms_;
   std::shared_ptr<MscclppGpuEventPool> event_pool_;
-  std::optional<std::chrono::steady_clock::time_point> start_completed_time_;
+  std::chrono::steady_clock::time_point construct_time_;
 };
 
 }  // namespace torch::comms
