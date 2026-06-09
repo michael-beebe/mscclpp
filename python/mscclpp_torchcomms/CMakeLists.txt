@@ -29,8 +29,10 @@ if(PYBIND11_FIND_RESULT EQUAL 0 AND PYBIND11_CMAKE_DIR)
 endif()
 find_package(pybind11 REQUIRED)
 
-# Gather our C++ sources
+# Gather our C++ sources. NcclDynamicLoader.cpp is the entry point for the
+# separate _comms_nccl target — exclude it from the _comms_mscclpp module.
 file(GLOB_RECURSE TORCHCOMM_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/csrc/*.cpp)
+list(REMOVE_ITEM TORCHCOMM_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/csrc/NcclDynamicLoader.cpp)
 
 # Torchcomms framework sources we need to compile in directly.
 # Our module inherits from TorchWork, TorchCommBackend, and registers with
@@ -108,4 +110,94 @@ add_custom_target(torchcomm_lib_copy ALL
         ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/_comms_mscclpp*.so
         ${CMAKE_CURRENT_SOURCE_DIR}
     DEPENDS _comms_mscclpp
+)
+
+# -----------------------------------------------------------------------------
+# Second target: _comms_nccl
+#
+# This builds the upstream torchcomms NCCL backend sources from
+# build-torchcomm/_deps/torchcomms-src/comms/torchcomms/nccl/ into a separate
+# .so, paired with our own NcclDynamicLoader.cpp that publishes the
+# create_dynamic_loader_nccl entry point torchcomms's TorchCommFactory dlopen
+# path requires.
+#
+# Why we don't reuse the upstream NCCL CMakeLists: it depends on the
+# torchcomms top-level CMake project that defines the `torchcomms` static
+# library and the ROOT, CONDA_INCLUDE, etc. variables. Mirroring the small
+# bit we need here keeps the dependency tree shallow and ensures the .so we
+# produce loads correctly through TorchCommFactory.
+# -----------------------------------------------------------------------------
+
+set(TORCHCOMMS_NCCL_BACKEND_SOURCES
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/NcclApi.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/TorchCommNCCL.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/TorchCommNCCLBootstrap.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/TorchCommNCCLCCA.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/TorchCommNCCLPy.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/TorchCommNCCLUtils.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/TorchWorkNCCL.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/nccl/TorchWorkNCCLQueue.cpp
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/device/cuda/CudaApi.cpp
+)
+
+# Framework sources are shared between _comms_mscclpp and _comms_nccl. Each
+# .so gets its own copy of TorchCommFactory's singleton (RTLD_LOCAL load) so
+# the registrations don't leak across backends.
+pybind11_add_module(_comms_nccl
+    ${TORCHCOMMS_NCCL_BACKEND_SOURCES}
+    ${TORCHCOMMS_FRAMEWORK_SOURCES}
+    ${CMAKE_CURRENT_SOURCE_DIR}/csrc/NcclDynamicLoader.cpp
+    # TracingGuard.cpp lives outside the framework set used by mscclpp because
+    # only the NCCL backend references it (via TracingGuard.hpp).
+    ${torchcomms_SOURCE_DIR}/comms/torchcomms/utils/TracingGuard.cpp
+)
+
+# Locate libnccl.so.2 shipped with PyTorch (the same one PyTorch's c10d uses).
+get_filename_component(_TORCH_LIB_DIR "${TORCH_INSTALL_PREFIX}/lib" ABSOLUTE)
+set(_NCCL_PYTORCH_INCLUDE "${TORCH_INSTALL_PREFIX}/../nvidia/nccl/include")
+set(_NCCL_PYTORCH_LIB     "${TORCH_INSTALL_PREFIX}/../nvidia/nccl/lib/libnccl.so.2")
+if(NOT EXISTS "${_NCCL_PYTORCH_LIB}")
+    message(FATAL_ERROR
+        "Could not find PyTorch's bundled libnccl.so.2 at ${_NCCL_PYTORCH_LIB}. "
+        "Install PyTorch with the nvidia-nccl-cu12 wheel.")
+endif()
+
+target_include_directories(_comms_nccl SYSTEM PRIVATE
+    ${torchcomms_SOURCE_DIR}
+    ${_NCCL_PYTORCH_INCLUDE}
+    ${GPU_INCLUDE_DIRS}
+)
+
+target_link_libraries(_comms_nccl PRIVATE
+    ${TORCH_LIBRARIES}
+    ${GPU_LIBRARIES}
+    ${_NCCL_PYTORCH_LIB}
+    glog::glog
+)
+
+if(EXISTS "${TORCH_PYTHON_LIB}")
+    target_link_libraries(_comms_nccl PRIVATE "${TORCH_PYTHON_LIB}")
+endif()
+
+# Match the NVSHMEM macro used in the historical build (NcclApi.cpp checks it).
+target_compile_definitions(_comms_nccl PRIVATE
+    USE_NVSHMEM
+    # fmt v12 ships in PyTorch's bundled headers (torch/include/fmt/), but only
+    # fmt v11 is available as a linkable shared object (libfmt.so.11 in conda).
+    # Compiling against v12 headers and linking against v11 yields an
+    # ``undefined symbol: fmt::v12::vformat...`` at dlopen time. Force the
+    # header-only build of whichever fmt headers are picked so all fmt code
+    # is inlined into _comms_nccl.so itself, eliminating the runtime dep.
+    FMT_HEADER_ONLY
+)
+
+target_compile_features(_comms_nccl PRIVATE cxx_std_20)
+
+install(TARGETS _comms_nccl LIBRARY DESTINATION mscclpp_torchcomms COMPONENT torchcomm)
+
+add_custom_target(torchcomm_nccl_copy ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}/_comms_nccl*.so
+        ${CMAKE_CURRENT_SOURCE_DIR}
+    DEPENDS _comms_nccl
 )
