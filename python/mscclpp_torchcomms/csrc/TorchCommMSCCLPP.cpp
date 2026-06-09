@@ -5,6 +5,7 @@
 
 #include <ATen/cuda/CUDAContext.h>
 
+#include <chrono>
 #include <comms/torchcomms/TorchCommFactory.hpp>
 #include <cstdlib>
 #include <iostream>
@@ -83,10 +84,39 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::ncclFallback(const char* op, cud
     throw std::runtime_error(std::string("[TorchCommMSCCLPP] ") + op +
                              " requires NCCL fallback (libnccl.so.2 not found)");
   }
+  // R6: under trace_>=2, time the fallback NCCL call so we can attribute the
+  // ~5% MSCCL++-vs-NCCL gap to either wrapper dispatch (per-call wrapper time)
+  // or the NCCL kernel itself. Two extra events per fallback call is fine
+  // because trace=2 is opt-in.
+  const auto wrapperEntry =
+      trace_ >= 2 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+  cudaEvent_t kStart = nullptr, kEnd = nullptr;
+  std::chrono::steady_clock::time_point launchStart;
+  if (trace_ >= 2) {
+    MSCCLPP_CUDATHROW(cudaEventCreateWithFlags(&kStart, cudaEventDefault));
+    MSCCLPP_CUDATHROW(cudaEventCreateWithFlags(&kEnd, cudaEventDefault));
+    MSCCLPP_CUDATHROW(cudaEventRecord(kStart, stream));
+    launchStart = std::chrono::steady_clock::now();
+  }
+
   auto work = c10::make_intrusive<TorchWorkMSCCLPP>(stream, device_.index(), timeout, event_pool_);
   work->recordStart();
   std::forward<Fn>(body)();
   work->recordEnd();
+
+  if (trace_ >= 2) {
+    MSCCLPP_CUDATHROW(cudaEventRecord(kEnd, stream));
+    const auto wrapperUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(launchStart - wrapperEntry).count();
+    MSCCLPP_CUDATHROW(cudaEventSynchronize(kEnd));
+    float kernelMs = 0.0f;
+    MSCCLPP_CUDATHROW(cudaEventElapsedTime(&kernelMs, kStart, kEnd));
+    MSCCLPP_CUDATHROW(cudaEventDestroy(kStart));
+    MSCCLPP_CUDATHROW(cudaEventDestroy(kEnd));
+    std::cerr << "[MSCCLPP] rank=" << rank_ << " collective=" << op << " -> NCCL_FALLBACK"
+              << " wrapper_us=" << wrapperUs << " kernel_us=" << static_cast<long>(kernelMs * 1000.0f)
+              << std::endl;
+  }
   return work;
 }
 
@@ -259,10 +289,19 @@ void TorchCommMSCCLPP::init(at::Device device, const std::string& name, const Co
   event_pool_ = std::make_shared<MscclppGpuEventPool>(256);
   nccl_ = NcclFallback::tryCreate(comm_, rank_, size_);
 
-  // R2: cache the trace flag once instead of calling std::getenv() on every
+  // R2: cache the trace level once instead of calling std::getenv() on every
   // collective dispatch. The env var isn't designed to be runtime-toggleable.
-  if (const char* v = std::getenv("MSCCLPP_TORCHCOMMS_TRACE"); v && v[0] && std::string(v) != "0") {
-    trace_ = true;
+  //   "0" or unset -> 0 (silent)
+  //   "1"          -> 1 (algo line per dispatch)
+  //   anything else non-empty -> 2 (algo line + timing)
+  if (const char* v = std::getenv("MSCCLPP_TORCHCOMMS_TRACE"); v && v[0]) {
+    if (std::string(v) == "0") {
+      trace_ = 0;
+    } else if (std::string(v) == "1") {
+      trace_ = 1;
+    } else {
+      trace_ = 2;
+    }
   }
 
   initialized_ = true;
@@ -343,6 +382,10 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::executeCollective(const std::str
                                                                   void* recvbuf, size_t sendBytes, size_t recvBytes,
                                                                   mscclpp::DataType dtype, mscclpp::ReduceOp reduceOp,
                                                                   bool async_op, std::chrono::milliseconds timeout) {
+  // R6: when trace_>=2, capture wall-clock entry to attribute wrapper overhead.
+  const auto wrapperEntry =
+      trace_ >= 2 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
   cudaStream_t stream = getOperationStream(async_op);
 
   // R3: cache the (collective, size-bucket) -> algo lookup. selectAlgorithm()
@@ -370,14 +413,48 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::executeCollective(const std::str
     throw std::runtime_error("[TorchCommMSCCLPP] no algorithm registered for '" + collective +
                              "' size=" + std::to_string(sendBytes));
   }
-  // R2: use cached trace_ flag instead of std::getenv on every call.
-  if (trace_) {
+
+  // R6: under trace_>=2, time the kernel synchronously via dedicated start/end
+  // events. We deliberately do NOT reuse the TorchWork end_event because that
+  // one is consumed by the consumer's wait()/checkStatus() path — sampling
+  // it here would race. Allocating two extra events per call is fine because
+  // trace=2 is diagnostic-only (off by default).
+  cudaEvent_t kStart = nullptr, kEnd = nullptr;
+  std::chrono::steady_clock::time_point launchStart;
+  if (trace_ >= 2) {
+    MSCCLPP_CUDATHROW(cudaEventCreateWithFlags(&kStart, cudaEventDefault));
+    MSCCLPP_CUDATHROW(cudaEventCreateWithFlags(&kEnd, cudaEventDefault));
+    MSCCLPP_CUDATHROW(cudaEventRecord(kStart, stream));
+    launchStart = std::chrono::steady_clock::now();
+  }
+
+  auto work = runAlgorithm(algo, sendbuf, recvbuf, sendBytes, recvBytes, dtype, reduceOp, stream, timeout);
+
+  if (trace_ >= 2) {
+    MSCCLPP_CUDATHROW(cudaEventRecord(kEnd, stream));
+    // Wall-clock time we spent in our wrapper code BEFORE the kernel launched.
+    const auto wrapperUs =
+        std::chrono::duration_cast<std::chrono::microseconds>(launchStart - wrapperEntry).count();
+    // Sync to read kernel time. Expensive (stalls CPU until GPU done) but
+    // unavoidable for accurate per-call attribution. trace=2 is opt-in.
+    MSCCLPP_CUDATHROW(cudaEventSynchronize(kEnd));
+    float kernelMs = 0.0f;
+    MSCCLPP_CUDATHROW(cudaEventElapsedTime(&kernelMs, kStart, kEnd));
+    MSCCLPP_CUDATHROW(cudaEventDestroy(kStart));
+    MSCCLPP_CUDATHROW(cudaEventDestroy(kEnd));
+    const char* atype = (algo->type() == mscclpp::AlgorithmType::Native) ? "NATIVE" : "DSL";
+    std::cerr << "[MSCCLPP] rank=" << rank_ << " collective=" << collective << " bytes=" << sendBytes
+              << " dtype=" << static_cast<int>(dtype) << " -> algo='" << algo->name() << "' (" << atype
+              << ") wrapper_us=" << wrapperUs << " kernel_us=" << static_cast<long>(kernelMs * 1000.0f)
+              << std::endl;
+  } else if (trace_ >= 1) {
     const char* atype = (algo->type() == mscclpp::AlgorithmType::Native) ? "NATIVE" : "DSL";
     std::cerr << "[MSCCLPP] rank=" << rank_ << " collective=" << collective << " bytes=" << sendBytes
               << " dtype=" << static_cast<int>(dtype) << " -> algo='" << algo->name() << "' (" << atype << ")"
               << std::endl;
   }
-  return runAlgorithm(algo, sendbuf, recvbuf, sendBytes, recvBytes, dtype, reduceOp, stream, timeout);
+
+  return work;
 }
 
 c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::all_reduce(at::Tensor& tensor, const ReduceOp& op, bool async_op,
@@ -462,7 +539,7 @@ c10::intrusive_ptr<TorchWork> TorchCommMSCCLPP::reduce_scatter_single(at::Tensor
     }
   }
   if (algo) {
-    if (trace_) {  // R2: cached at init
+    if (trace_ >= 1) {  // R2: cached at init; R6: also gates the higher-level timing path
       const char* atype = (algo->type() == mscclpp::AlgorithmType::Native) ? "NATIVE" : "DSL";
       std::cerr << "[MSCCLPP] rank=" << rank_ << " collective=reducescatter bytes=" << input.nbytes()
                 << " dtype=" << static_cast<int>(*mscclppDtype) << " -> algo='" << algo->name() << "' (" << atype

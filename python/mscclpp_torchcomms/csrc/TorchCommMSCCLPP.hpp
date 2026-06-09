@@ -212,9 +212,17 @@ class TorchCommMSCCLPP : public TorchCommBackend, public std::enable_shared_from
   /// init() time. Avoids calling std::getenv on every collective dispatch
   /// (~50-200 ns × 2000+ calls/epoch on FSDP2 workloads). The env var is
   /// not designed to be runtime-toggleable, so a one-shot read at init is
-  /// the right semantics. Set MSCCLPP_TORCHCOMMS_TRACE to any non-"0"
-  /// non-empty value to enable.
-  bool trace_ = false;
+  /// the right semantics.
+  ///
+  /// Levels (R6):
+  ///   0 — silent
+  ///   1 — one [MSCCLPP] line per dispatch with algo + bytes + dtype
+  ///   2 — same as 1, plus wrapper_us (CPU wrapper overhead) and
+  ///       kernel_us (GPU kernel time from start-to-end event). Useful for
+  ///       attributing per-call cost between wrapper, selector, and kernel.
+  ///
+  /// Any non-empty value other than "0" or "1" maps to level 2.
+  int trace_ = 0;
 
   /// R3: per-comm cache of (collective, message-size-bucket) → algorithm.
   ///
