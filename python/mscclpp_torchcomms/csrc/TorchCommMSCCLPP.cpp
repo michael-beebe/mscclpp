@@ -113,6 +113,32 @@ std::shared_ptr<mscclpp::Algorithm> TorchCommMSCCLPP::selectAlgorithm(
                           mscclpp::isCuMemMapAllocated(request.outputBuffer);
   cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
   cudaStreamIsCapturing(request.stream, &capture);
+
+  // Two fields below — symmetricMemory and ncclDlopenSharedLib — are
+  // deliberately hardcoded to false rather than runtime-detected. The reasons
+  // differ:
+  //
+  // symmetricMemory: PyTorch's c10d SymmetricMemory API (the precondition
+  //   for MSCCL++'s zero-copy and fullmesh2-cache-friendly paths) doesn't
+  //   expose a public "is this tensor symmetric memory?" probe — callers are
+  //   expected to know because they allocated via empty_strided_p2p(). The
+  //   selector inputs here are raw pointers from the c10d Backend interface,
+  //   stripped of the at::Tensor that originally carried the storage
+  //   allocator. Until PyTorch exposes a stable probe (or we plumb the
+  //   at::Tensor through executeCollective), we conservatively report false,
+  //   which routes us to the cache-friendly fullmesh path via the allgather
+  //   intercept below. When this changes, the fix is:
+  //     1. Add `bool symmetric_memory` param to executeCollective().
+  //     2. Each collective method computes it from its at::Tensor's storage
+  //        allocator and passes through.
+  //     3. Wire it here.
+  //
+  // ncclDlopenSharedLib: signals to selectors that we have a libnccl.so
+  //   fallback they can defer to (e.g. for >32MiB allgather on NVIDIA).
+  //   We DO have NcclFallback dlopened at init when libnccl is available,
+  //   but the selector's use of this flag predates our integration's
+  //   fallback path — flipping it to true would change algorithm choice in
+  //   ways we haven't validated. Left false until tested.
   mscclpp::nccl::AlgorithmSelectorConfig config{
       .symmetricMemory = false,
       .nvlsSupported = isNvlsSupported,
@@ -136,20 +162,36 @@ std::shared_ptr<mscclpp::Algorithm> TorchCommMSCCLPP::selectAlgorithm(
     return mscclpp::nccl::selectMultiNodeAlgorithm(algoMap, request, config);
   }
   if (request.collective == "allgather") {
-    // The default selector picks `default_allgather_fullmesh2` for every
-    // allgather <= 32 MiB. fullmesh2's context-key generator returns a unique
-    // key (`tag++`) on every call when symmetric memory is not available,
-    // so the per-buffer context cache misses on every dispatch and we
-    // re-register IPC memory across all peers via TcpBootstrap each time.
-    // For FSDP2-style workloads (thousands of <32 MiB allgathers per epoch)
-    // that registration cost dominates and makes us ~20% slower than NCCL.
+    // The upstream selector picks `default_allgather_fullmesh2` for every
+    // allgather <= 32 MiB. fullmesh2's contextKeyGenFunc returns a unique
+    // key (`tag++`) on every call when symmetric memory is not available
+    // (allgather_fullmesh_2.cu:195), so the per-buffer context cache misses
+    // on every dispatch and we re-register IPC memory across all peers via
+    // TcpBootstrap each time. For FSDP2-style workloads (thousands of
+    // <32 MiB allgathers per epoch) that registration cost dominates.
     //
-    // `default_allgather_fullmesh` always returns the same context key
-    // (constant key {nullptr, nullptr, 0, 0, 0}) so its context is set up
-    // once and reused for every subsequent call. Prefer it whenever symmetric
-    // memory is not available; fall through to the default selector when it
-    // is (since fullmesh2 caches correctly in that case).
-    if (!config.symmetricMemory && !config.isCuMemMapAllocated) {
+    // Our intercept here picks a cache-friendly alternative when we can't
+    // get fullmesh2's cache to hit. The order — best-to-worst — is:
+    //
+    //   1. Any future NVLS allgather variant (e.g. "*allgather_nvls_*").
+    //      Probed by name prefix so this code keeps working without edits
+    //      as the library adds new NVLS-capable algorithms.
+    //   2. `default_allgather_fullmesh` — constant context key
+    //      ({nullptr, nullptr, 0, 0, 0}), so context is set up once and
+    //      reused on every subsequent call. Reliable cache-friendly fallback.
+    //   3. Fall through to the upstream selector (which picks fullmesh2
+    //      when symmetric memory IS available, or fullmesh for >32MiB on
+    //      NVIDIA without NCCL fallback).
+    //
+    // We only intercept when cache-hit conditions for fullmesh2 are NOT
+    // met; otherwise the upstream selector's choice is already optimal.
+    const bool fullmesh2CacheFriendly = config.symmetricMemory || config.isCuMemMapAllocated;
+    if (!fullmesh2CacheFriendly) {
+      if (config.nvlsSupported) {
+        for (const auto& [name, algo] : algoMap) {
+          if (name.find("allgather_nvls") != std::string::npos) return algo;
+        }
+      }
       auto it = algoMap.find("default_allgather_fullmesh");
       if (it != algoMap.end()) return it->second;
     }
