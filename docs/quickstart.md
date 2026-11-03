@@ -149,15 +149,17 @@ MSCCL++ relies on a custom verbs shim library that intercepts standard `libibver
 
 ---
 
-### 2. Build MSCCL++ with MRC Enabled
+### 2. Build MSCCL++ with the MRC Shim Enabled
 
-Enable MRC support during the build by adding the following CMake option:
+Enable the MRC verbs shim during the build by adding the following CMake option:
 
 ```bash
--DMSCCLPP_USE_MRC=ON
+-DMSCCLPP_USE_MRC_SHIM=ON
 ```
 
 This configures MSCCL++ to use the MRC-enabled verbs layer at runtime.
+The former `MSCCLPP_USE_MRC` shim option is now named `MSCCLPP_USE_MRC_SHIM`;
+`MSCCLPP_USE_MRC` enables native libmrc support instead.
 
 ### 3. Configure Runtime Environment
 
