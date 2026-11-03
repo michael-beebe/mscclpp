@@ -18,15 +18,32 @@ struct mrc_qp;
 
 namespace mscclpp {
 
+// QP info to be shared with the remote peer.
+struct MrcQpInfo {
+  uint16_t lid;
+  uint8_t linkLayer;
+  uint32_t qpn;
+  uint64_t spn;
+  int mtu;
+  uint64_t iid;
+  bool isGrh;
+};
+
 class MrcQp {
  public:
   ~MrcQp();
   MrcQp(const MrcQp&) = delete;
   MrcQp& operator=(const MrcQp&) = delete;
 
+  MrcQpInfo& getInfo() { return info_; }
+
  private:
-  MrcQp(mrc_context* context, ibv_pd* pd, int port, uint64_t evProfileId, int maxSendCqSize, int maxSendWr,
-        int maxRecvWr);
+  MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port, int gidIndex, uint64_t evProfileId,
+        int maxSendCqSize, int maxSendWr, int maxRecvWr);
+
+  int portNum_;
+  int gidIndex_;
+  MrcQpInfo info_;
 
   mrc_cq* sendCq_;
   mrc_cq* recvCq_;
@@ -44,7 +61,8 @@ class MrcCtx {
 
   // The installed provider requires an explicit port for INIT, although mrc.h lists IBV_QP_PORT as unsupported.
   // The EV profile must already be configured by the controller.
-  std::shared_ptr<MrcQp> createQp(int port, uint64_t evProfileId, int maxSendCqSize, int maxSendWr, int maxRecvWr);
+  std::shared_ptr<MrcQp> createQp(int port, int gidIndex, uint64_t evProfileId, int maxSendCqSize, int maxSendWr,
+                                  int maxRecvWr);
 
   const std::string& getDevName() const { return devName_; }
 

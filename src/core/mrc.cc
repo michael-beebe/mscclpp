@@ -15,9 +15,9 @@ namespace mscclpp {
 static_assert(MRC_API_CURRENT_VERSION == MRC_API_VER(1, 0, 0));
 static_assert(MRC_API_VER_USED == MRC_API_VER(1, 0, 0));
 
-MrcQp::MrcQp(mrc_context* context, ibv_pd* pd, int port, uint64_t evProfileId, int maxSendCqSize, int maxSendWr,
-             int maxRecvWr)
-    : sendCq_(nullptr), recvCq_(nullptr), qp_(nullptr) {
+MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port, int gidIndex, uint64_t evProfileId,
+             int maxSendCqSize, int maxSendWr, int maxRecvWr)
+    : portNum_(port), gidIndex_(gidIndex), info_{}, sendCq_(nullptr), recvCq_(nullptr), qp_(nullptr) {
   if (maxSendCqSize <= 0 || maxSendWr <= 0 || maxRecvWr < 0) {
     throw Error("Native MRC requires positive send CQ/WR limits and a nonnegative receive WR limit",
                 ErrorCode::InvalidUsage);
@@ -26,15 +26,15 @@ MrcQp::MrcQp(mrc_context* context, ibv_pd* pd, int port, uint64_t evProfileId, i
     throw Error("Native MRC requires a port between 1 and 255", ErrorCode::InvalidUsage);
   }
 
-  std::unique_ptr<mrc_cq, decltype(&mrc_destroy_cq)> sendCq(mrc_create_cq(context, maxSendCqSize, nullptr, nullptr, 0),
-                                                            mrc_destroy_cq);
+  std::unique_ptr<mrc_cq, decltype(&mrc_destroy_cq)> sendCq(
+      mrc_create_cq(mrcContext, maxSendCqSize, nullptr, nullptr, 0), mrc_destroy_cq);
   if (!sendCq) {
     throw IbError("mrc_create_cq failed for send CQ", errno);
   }
 
   std::unique_ptr<mrc_cq, decltype(&mrc_destroy_cq)> recvCq(nullptr, mrc_destroy_cq);
   if (maxRecvWr > 0) {
-    recvCq.reset(mrc_create_cq(context, maxRecvWr, nullptr, nullptr, 0));
+    recvCq.reset(mrc_create_cq(mrcContext, maxRecvWr, nullptr, nullptr, 0));
     if (!recvCq) {
       throw IbError("mrc_create_cq failed for receive CQ", errno);
     }
@@ -48,21 +48,51 @@ MrcQp::MrcQp(mrc_context* context, ibv_pd* pd, int port, uint64_t evProfileId, i
   attrs.cap.max_send_sge = 1;
   attrs.cap.max_recv_sge = 1;
   attrs.pd = pd;
-  std::unique_ptr<mrc_qp, decltype(&mrc_destroy_qp)> qp(mrc_create_qp(context, &attrs), mrc_destroy_qp);
+  std::unique_ptr<mrc_qp, decltype(&mrc_destroy_qp)> qp(mrc_create_qp(mrcContext, &attrs), mrc_destroy_qp);
   if (!qp) {
     throw IbError("mrc_create_qp failed", errno);
   }
 
+  ibv_port_attr portAttr{};
+  int ret = ibv_query_port(context, portNum_, &portAttr);
+  if (ret != 0) {
+    throw IbError("ibv_query_port failed for native MRC QP", ret > 0 ? ret : errno);
+  }
+  info_.lid = portAttr.lid;
+  info_.linkLayer = portAttr.link_layer;
+  info_.mtu = portAttr.active_mtu;
+  info_.isGrh = (portAttr.flags & IBV_QPF_GRH_REQUIRED);
+
+  ret = mrc_get_qpn(qp.get(), &info_.qpn);
+  if (ret != 0) {
+    throw IbError("mrc_get_qpn failed", ret > 0 ? ret : errno);
+  }
+
+  if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND || info_.isGrh) {
+    if (gidIndex_ < 0 || gidIndex_ >= portAttr.gid_tbl_len) {
+      throw Error("invalid native MRC GID index " + std::to_string(gidIndex_) + " for port " +
+                      std::to_string(portNum_) + " (GID table length " + std::to_string(portAttr.gid_tbl_len) + ")",
+                  ErrorCode::InvalidUsage);
+    }
+    ibv_gid gid{};
+    ret = ibv_query_gid(context, portNum_, gidIndex_, &gid);
+    if (ret != 0) {
+      throw IbError("ibv_query_gid failed for native MRC QP", ret > 0 ? ret : errno);
+    }
+    info_.spn = gid.global.subnet_prefix;
+    info_.iid = gid.global.interface_id;
+  }
+
   ibv_qp_attr qpAttrs{};
   qpAttrs.qp_state = IBV_QPS_INIT;
-  qpAttrs.port_num = port;
+  qpAttrs.port_num = portNum_;
   qpAttrs.pkey_index = 0;
   qpAttrs.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
 
   mrc_qp_attr mrcAttrs{};
   mrcAttrs.ev_profile_id = evProfileId;
-  int ret = mrc_modify_qp(qp.get(), &qpAttrs, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS,
-                          &mrcAttrs, MRC_QP_EV_PROFILE_ID);
+  ret = mrc_modify_qp(qp.get(), &qpAttrs, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS,
+                      &mrcAttrs, MRC_QP_EV_PROFILE_ID);
   if (ret != 0) {
     throw IbError("mrc_modify_qp failed transitioning to INIT", ret > 0 ? ret : errno);
   }
@@ -140,9 +170,10 @@ MrcCtx::~MrcCtx() {
   ibv_close_device(context_);
 }
 
-std::shared_ptr<MrcQp> MrcCtx::createQp(int port, uint64_t evProfileId, int maxSendCqSize, int maxSendWr,
+std::shared_ptr<MrcQp> MrcCtx::createQp(int port, int gidIndex, uint64_t evProfileId, int maxSendCqSize, int maxSendWr,
                                         int maxRecvWr) {
-  return std::shared_ptr<MrcQp>(new MrcQp(mrcContext_, pd_, port, evProfileId, maxSendCqSize, maxSendWr, maxRecvWr));
+  return std::shared_ptr<MrcQp>(
+      new MrcQp(context_, mrcContext_, pd_, port, gidIndex, evProfileId, maxSendCqSize, maxSendWr, maxRecvWr));
 }
 
 }  // namespace mscclpp
