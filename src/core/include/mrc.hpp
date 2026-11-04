@@ -6,17 +6,43 @@
 
 #if defined(MSCCLPP_USE_MRC)
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
 
 struct ibv_context;
 struct ibv_pd;
+struct ibv_mr;
 struct mrc_context;
 struct mrc_cq;
 struct mrc_qp;
 
 namespace mscclpp {
+
+struct MrcMrInfo {
+  uint64_t addr;
+  uint32_t rkey;
+};
+
+class MrcMr {
+ public:
+  ~MrcMr();
+  MrcMr(const MrcMr&) = delete;
+  MrcMr& operator=(const MrcMr&) = delete;
+
+  MrcMrInfo getInfo() const;
+  const void* getBuff() const;
+  uint32_t getLkey() const;
+
+ private:
+  MrcMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect);
+
+  ibv_mr* mr_;
+  void* buff_;
+
+  friend class MrcCtx;
+};
 
 // QP info to be shared with the remote peer.
 struct MrcQpInfo {
@@ -66,6 +92,7 @@ class MrcCtx {
   // The EV profile must already be configured by the controller.
   std::shared_ptr<MrcQp> createQp(int port, int gidIndex, uint64_t evProfileId, int maxSendCqSize, int maxSendWr,
                                   int maxRecvWr);
+  std::unique_ptr<const MrcMr> registerMr(void* buff, std::size_t size);
 
   const std::string& getDevName() const { return devName_; }
 
@@ -74,6 +101,7 @@ class MrcCtx {
   ibv_context* context_;
   ibv_pd* pd_;
   mrc_context* mrcContext_;
+  bool isDataDirect_;
 };
 
 }  // namespace mscclpp

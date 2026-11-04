@@ -6,14 +6,135 @@
 #if defined(MSCCLPP_USE_MRC)
 
 #include <mrc.h>
+#include <unistd.h>
 
 #include <cerrno>
+#include <limits>
 #include <mscclpp/errors.hpp>
+#include <mscclpp/gpu_utils.hpp>
+
+#if defined(MSCCLPP_USE_MLX5DV)
+#include "mlx5dv_wrapper.hpp"
+#endif
 
 namespace mscclpp {
 
 static_assert(MRC_API_CURRENT_VERSION == MRC_API_VER(1, 0, 0));
 static_assert(MRC_API_VER_USED == MRC_API_VER(1, 0, 0));
+
+MrcMr::MrcMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] bool isDataDirect) : mr_(nullptr), buff_(buff) {
+  if (buff == nullptr || size == 0) {
+    throw Error("Native MRC requires a nonnull MR buffer and positive size", ErrorCode::InvalidUsage);
+  }
+  constexpr int accessFlags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE;
+
+  long pageSize = sysconf(_SC_PAGESIZE);
+  if (pageSize <= 0) {
+    throw Error("Unable to query page size for native MRC registration", ErrorCode::SystemError);
+  }
+  uintptr_t bufferAddress = reinterpret_cast<uintptr_t>(buff);
+  std::size_t offset = bufferAddress % pageSize;
+  if (size > std::numeric_limits<std::size_t>::max() - offset - (pageSize - 1)) {
+    throw Error("Native MRC registration range is too large", ErrorCode::InvalidUsage);
+  }
+  uintptr_t address = bufferAddress - offset;
+  std::size_t rangeSize = ((size + offset + pageSize - 1) / pageSize) * pageSize;
+
+  int gpuId = -1;
+#if defined(MSCCLPP_USE_CUDA)
+  CUmemorytype memoryType{};
+  CUresult result =
+      cuPointerGetAttribute(&memoryType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, reinterpret_cast<CUdeviceptr>(buff));
+  if (result != CUDA_ERROR_NOT_INITIALIZED && result != CUDA_ERROR_INVALID_VALUE) {
+    MSCCLPP_CUTHROW(result);
+    if (memoryType == CU_MEMORYTYPE_DEVICE || memoryType == CU_MEMORYTYPE_UNIFIED) {
+      gpuId = detail::gpuIdFromAddress(buff);
+    }
+  }
+#else
+  gpuId = detail::gpuIdFromAddress(buff);
+#endif
+  CudaDeviceGuard deviceGuard(gpuId);
+
+#if defined(MSCCLPP_USE_CUDA)
+  if (gpuId >= 0) {
+    CUdevice device;
+    MSCCLPP_CUTHROW(cuDeviceGet(&device, gpuId));
+    int dmaBufSupported = 0;
+    MSCCLPP_CUTHROW(cuDeviceGetAttribute(&dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, device));
+    if (dmaBufSupported) {
+      int fd = -1;
+      auto closeFd = [](int* descriptor) {
+        if (*descriptor >= 0) ::close(*descriptor);
+      };
+      // Track fd by address so retries also close the replacement descriptor.
+      std::unique_ptr<int, decltype(closeFd)> fdGuard(&fd, closeFd);
+      auto exportFd = [&](unsigned long long flags) {
+        if (fd >= 0) ::close(fd);
+        fd = -1;
+        return cuMemGetHandleForAddressRange(&fd, address, rangeSize, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, flags);
+      };
+
+      bool usedPcieMapping = false;
+#if CUDA_VERSION >= 12080
+      result = exportFd(CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
+      usedPcieMapping = result == CUDA_SUCCESS && fd >= 0;
+#endif
+      if (!usedPcieMapping) {
+        result = exportFd(0);
+      }
+      MSCCLPP_CUTHROW(result);
+      if (fd < 0) {
+        throw Error("GPU DMA-BUF export returned an invalid descriptor", ErrorCode::SystemError);
+      }
+
+      auto registerFd = [&] {
+        ibv_mr* mr = nullptr;
+#if defined(MSCCLPP_USE_MLX5DV)
+        if (isDataDirect) {
+          mr = MLX5DV::mlx5dv_reg_dmabuf_mr(pd, offset, size, bufferAddress, fd, accessFlags);
+        }
+#endif
+        if (mr == nullptr) {
+          mr = ibv_reg_dmabuf_mr(pd, offset, size, bufferAddress, fd, accessFlags);
+        }
+        return mr;
+      };
+      mr_ = registerFd();
+      if (mr_ == nullptr && usedPcieMapping) {
+        MSCCLPP_CUTHROW(exportFd(0));
+        if (fd < 0) {
+          throw Error("GPU DMA-BUF export returned an invalid descriptor", ErrorCode::SystemError);
+        }
+        mr_ = registerFd();
+      }
+      if (mr_ == nullptr) {
+        throw IbError("DMA-BUF registration failed for native MRC", errno);
+      }
+      return;
+    }
+    if (isCuMemMapAllocated(buff)) {
+      throw Error("Native MRC VMM registration requires DMA-BUF support", ErrorCode::InvalidUsage);
+    }
+    if (::access("/sys/module/nvidia_peermem", F_OK) != 0) {
+      throw Error("nvidia_peermem kernel module is not loaded", ErrorCode::SystemError);
+    }
+  }
+#endif
+
+  mr_ = ibv_reg_mr(pd, reinterpret_cast<void*>(address), rangeSize, accessFlags);
+  if (mr_ == nullptr) {
+    throw IbError("ibv_reg_mr failed for native MRC", errno);
+  }
+}
+
+MrcMr::~MrcMr() { ibv_dereg_mr(mr_); }
+
+MrcMrInfo MrcMr::getInfo() const { return {reinterpret_cast<uint64_t>(buff_), mr_->rkey}; }
+
+const void* MrcMr::getBuff() const { return buff_; }
+
+uint32_t MrcMr::getLkey() const { return mr_->lkey; }
 
 MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port, int gidIndex, uint64_t evProfileId,
              int maxSendCqSize, int maxSendWr, int maxRecvWr)
@@ -142,9 +263,9 @@ void MrcQp::rts() {
   qpAttrs.qp_state = IBV_QPS_RTS;
   qpAttrs.sq_psn = 0;
   // The installed provider accepts these verbs retry fields despite the SDK's unsupported-fields table.
-  qpAttrs.retry_cnt = 7;  // FIXME: should this be set dynamically based on some environment variable?
-  qpAttrs.rnr_retry = 7;  // FIXME: should this be set dynamically based on some environment variable?
-
+  // FIXME: should this be set dynamically based on some environment variable?
+  qpAttrs.retry_cnt = 7;
+  qpAttrs.rnr_retry = 7;
   mrc_qp_attr mrcAttrs{};
   mrcAttrs.timeout = 14;
   int ret = mrc_modify_qp(qp_, &qpAttrs, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY, &mrcAttrs,
@@ -154,7 +275,8 @@ void MrcQp::rts() {
   }
 }
 
-MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr), pd_(nullptr), mrcContext_(nullptr) {
+MrcCtx::MrcCtx(const std::string& devName)
+    : devName_(devName), context_(nullptr), pd_(nullptr), mrcContext_(nullptr), isDataDirect_(false) {
   if (devName.empty()) {
     throw Error("Native MRC requires a device name", ErrorCode::InvalidUsage);
   }
@@ -189,6 +311,13 @@ MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr
     throw Error("Device does not support native MRC: " + devName, ErrorCode::InvalidUsage);
   }
 
+#if defined(MSCCLPP_USE_MLX5DV)
+  if (MLX5DV::isAvailable() && MLX5DV::mlx5dv_is_supported(context->device)) {
+    char sysfsPath[256];
+    isDataDirect_ = MLX5DV::mlx5dv_get_data_direct_sysfs_path(context.get(), sysfsPath, sizeof(sysfsPath)) == 0;
+  }
+#endif
+
   std::unique_ptr<ibv_pd, decltype(&ibv_dealloc_pd)> pd(ibv_alloc_pd(context.get()), ibv_dealloc_pd);
   if (!pd) {
     throw IbError("ibv_alloc_pd failed for " + devName, errno);
@@ -218,6 +347,10 @@ std::shared_ptr<MrcQp> MrcCtx::createQp(int port, int gidIndex, uint64_t evProfi
                                         int maxRecvWr) {
   return std::shared_ptr<MrcQp>(
       new MrcQp(context_, mrcContext_, pd_, port, gidIndex, evProfileId, maxSendCqSize, maxSendWr, maxRecvWr));
+}
+
+std::unique_ptr<const MrcMr> MrcCtx::registerMr(void* buff, std::size_t size) {
+  return std::unique_ptr<const MrcMr>(new MrcMr(pd_, buff, size, isDataDirect_));
 }
 
 }  // namespace mscclpp

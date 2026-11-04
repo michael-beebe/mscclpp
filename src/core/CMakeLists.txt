@@ -36,10 +36,11 @@ endif()
 
 if(MSCCLPP_USE_IB)
     target_compile_definitions(mscclpp_obj PUBLIC USE_IBVERBS)
-    if(MLX5_FOUND)
-        target_include_directories(mscclpp_obj SYSTEM PRIVATE ${MLX5_INCLUDE_DIRS})
-        target_compile_definitions(mscclpp_obj PRIVATE MSCCLPP_USE_MLX5DV)
-    endif()
+endif()
+
+if((MSCCLPP_USE_IB OR MSCCLPP_USE_MRC) AND MLX5_FOUND)
+    target_include_directories(mscclpp_obj SYSTEM PRIVATE ${MLX5_INCLUDE_DIRS})
+    target_compile_definitions(mscclpp_obj PRIVATE MSCCLPP_USE_MLX5DV)
 endif()
 
 if(MSCCLPP_USE_MRC_SHIM)
