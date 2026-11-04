@@ -110,6 +110,50 @@ MrcQp::~MrcQp() {
   }
 }
 
+void MrcQp::rtr(const MrcQpInfo& info) {
+  ibv_qp_attr qpAttrs{};
+  qpAttrs.qp_state = IBV_QPS_RTR;
+  qpAttrs.path_mtu = static_cast<ibv_mtu>(info.mtu);
+  qpAttrs.dest_qp_num = info.qpn;
+  qpAttrs.rq_psn = 0;
+  if (info.linkLayer == IBV_LINK_LAYER_ETHERNET || info.isGrh) {
+    qpAttrs.ah_attr.is_global = 1;
+    qpAttrs.ah_attr.grh.dgid.global.subnet_prefix = info.spn;
+    qpAttrs.ah_attr.grh.dgid.global.interface_id = info.iid;
+    qpAttrs.ah_attr.grh.sgid_index = gidIndex_;
+    qpAttrs.ah_attr.grh.hop_limit = 255;
+    // Match the reference program's traffic class on the installed provider.
+    qpAttrs.ah_attr.grh.traffic_class = 1;
+  }
+  qpAttrs.ah_attr.dlid = info.lid;
+  qpAttrs.ah_attr.port_num = portNum_;
+
+  mrc_qp_attr mrcAttrs{};
+  mrcAttrs.version = MRC_VERSION_1;
+  int ret = mrc_modify_qp(qp_, &qpAttrs, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN,
+                          &mrcAttrs, MRC_QP_PROTOCOL_VERSION);
+  if (ret != 0) {
+    throw IbError("mrc_modify_qp failed transitioning to RTR", ret > 0 ? ret : errno);
+  }
+}
+
+void MrcQp::rts() {
+  ibv_qp_attr qpAttrs{};
+  qpAttrs.qp_state = IBV_QPS_RTS;
+  qpAttrs.sq_psn = 0;
+  // The installed provider accepts these verbs retry fields despite the SDK's unsupported-fields table.
+  qpAttrs.retry_cnt = 7;  // FIXME: should this be set dynamically based on some environment variable?
+  qpAttrs.rnr_retry = 7;  // FIXME: should this be set dynamically based on some environment variable?
+
+  mrc_qp_attr mrcAttrs{};
+  mrcAttrs.timeout = 14;
+  int ret = mrc_modify_qp(qp_, &qpAttrs, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY, &mrcAttrs,
+                          MRC_QP_TIMEOUT);
+  if (ret != 0) {
+    throw IbError("mrc_modify_qp failed transitioning to RTS", ret > 0 ? ret : errno);
+  }
+}
+
 MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr), pd_(nullptr), mrcContext_(nullptr) {
   if (devName.empty()) {
     throw Error("Native MRC requires a device name", ErrorCode::InvalidUsage);

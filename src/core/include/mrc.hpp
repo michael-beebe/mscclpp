@@ -35,6 +35,9 @@ class MrcQp {
   MrcQp(const MrcQp&) = delete;
   MrcQp& operator=(const MrcQp&) = delete;
 
+  void rtr(const MrcQpInfo& info);
+  void rts();
+
   MrcQpInfo& getInfo() { return info_; }
 
  private:
