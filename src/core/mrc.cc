@@ -8,10 +8,16 @@
 #include <mrc.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <limits>
 #include <mscclpp/errors.hpp>
 #include <mscclpp/gpu_utils.hpp>
+
+#if defined(MSCCLPP_USE_CUDA)
+#include <filesystem>
+#include <fstream>
+#endif
 
 #if defined(MSCCLPP_USE_MLX5DV)
 #include "mlx5dv_wrapper.hpp"
@@ -22,7 +28,37 @@ namespace mscclpp {
 static_assert(MRC_API_CURRENT_VERSION == MRC_API_VER(1, 0, 0));
 static_assert(MRC_API_VER_USED == MRC_API_VER(1, 0, 0));
 
-MrcMr::MrcMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] bool isDataDirect) : mr_(nullptr), buff_(buff) {
+#if defined(MSCCLPP_USE_CUDA)
+static void checkGpuDmaTopology(CUdevice device, const std::string& dmaDevicePath) {
+  char busId[32]{};
+  MSCCLPP_CUTHROW(cuDeviceGetPCIBusId(busId, sizeof(busId), device));
+  std::error_code error;
+  auto gpuPath = std::filesystem::canonical(std::string("/sys/bus/pci/devices/") + busId, error);
+  if (error) {
+    throw Error("Unable to resolve GPU PCIe path for native MRC: " + error.message(), ErrorCode::SystemError);
+  }
+  auto dmaPath = std::filesystem::canonical(dmaDevicePath, error);
+  if (error) {
+    throw Error("Unable to resolve DMA device PCIe path for native MRC: " + error.message(), ErrorCode::SystemError);
+  }
+  std::filesystem::path common;
+  for (auto gpu = gpuPath.begin(), dma = dmaPath.begin(); gpu != gpuPath.end() && dma != dmaPath.end() && *gpu == *dma;
+       ++gpu, ++dma) {
+    common /= *gpu;
+  }
+  // Require a shared PCI bridge, not merely a common sysfs or PCI-domain directory.
+  std::ifstream pciClass(common / "class");
+  unsigned int classCode = 0;
+  if (!(pciClass >> std::hex >> classCode) || (classCode >> 8) != 0x0604) {
+    throw Error("Native MRC GPU " + std::string(busId) + " and DMA device " + dmaPath.string() +
+                    " do not share a PCIe bridge; select a compatible GPU/NIC pair",
+                ErrorCode::InvalidUsage);
+  }
+}
+#endif
+
+MrcMr::MrcMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] const std::string& dataDirectPath)
+    : mr_(nullptr), buff_(buff) {
   if (buff == nullptr || size == 0) {
     throw Error("Native MRC requires a nonnull MR buffer and positive size", ErrorCode::InvalidUsage);
   }
@@ -62,51 +98,37 @@ MrcMr::MrcMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] bool isD
     MSCCLPP_CUTHROW(cuDeviceGet(&device, gpuId));
     int dmaBufSupported = 0;
     MSCCLPP_CUTHROW(cuDeviceGetAttribute(&dmaBufSupported, CU_DEVICE_ATTRIBUTE_DMA_BUF_SUPPORTED, device));
+    std::string nicPath = std::string("/sys/class/infiniband/") + ibv_get_device_name(pd->context->device) + "/device";
     if (dmaBufSupported) {
+      bool useDataDirect = !dataDirectPath.empty();
+      checkGpuDmaTopology(device, useDataDirect ? dataDirectPath : nicPath);
+      unsigned long long exportFlags = 0;
+      if (useDataDirect) {
+#if CUDA_VERSION >= 12080
+        exportFlags = CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE;
+#else
+        throw Error("Native MRC Data Direct registration requires CUDA 12.8 or newer", ErrorCode::InvalidUsage);
+#endif
+      }
       int fd = -1;
       auto closeFd = [](int* descriptor) {
         if (*descriptor >= 0) ::close(*descriptor);
       };
-      // Track fd by address so retries also close the replacement descriptor.
       std::unique_ptr<int, decltype(closeFd)> fdGuard(&fd, closeFd);
-      auto exportFd = [&](unsigned long long flags) {
-        if (fd >= 0) ::close(fd);
-        fd = -1;
-        return cuMemGetHandleForAddressRange(&fd, address, rangeSize, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, flags);
-      };
-
-      bool usedPcieMapping = false;
-#if CUDA_VERSION >= 12080
-      result = exportFd(CU_MEM_RANGE_FLAG_DMA_BUF_MAPPING_TYPE_PCIE);
-      usedPcieMapping = result == CUDA_SUCCESS && fd >= 0;
-#endif
-      if (!usedPcieMapping) {
-        result = exportFd(0);
-      }
-      MSCCLPP_CUTHROW(result);
+      MSCCLPP_CUTHROW(
+          cuMemGetHandleForAddressRange(&fd, address, rangeSize, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, exportFlags));
       if (fd < 0) {
         throw Error("GPU DMA-BUF export returned an invalid descriptor", ErrorCode::SystemError);
       }
 
-      auto registerFd = [&] {
-        ibv_mr* mr = nullptr;
 #if defined(MSCCLPP_USE_MLX5DV)
-        if (isDataDirect) {
-          mr = MLX5DV::mlx5dv_reg_dmabuf_mr(pd, offset, size, bufferAddress, fd, accessFlags);
-        }
+      if (useDataDirect) {
+        // Data Direct requires an aligned MR; retain the logical buffer address in buff_.
+        mr_ = MLX5DV::mlx5dv_reg_dmabuf_mr(pd, 0, rangeSize, address, fd, accessFlags);
+      } else
 #endif
-        if (mr == nullptr) {
-          mr = ibv_reg_dmabuf_mr(pd, offset, size, bufferAddress, fd, accessFlags);
-        }
-        return mr;
-      };
-      mr_ = registerFd();
-      if (mr_ == nullptr && usedPcieMapping) {
-        MSCCLPP_CUTHROW(exportFd(0));
-        if (fd < 0) {
-          throw Error("GPU DMA-BUF export returned an invalid descriptor", ErrorCode::SystemError);
-        }
-        mr_ = registerFd();
+      {
+        mr_ = ibv_reg_dmabuf_mr(pd, offset, size, bufferAddress, fd, accessFlags);
       }
       if (mr_ == nullptr) {
         throw IbError("DMA-BUF registration failed for native MRC", errno);
@@ -116,6 +138,7 @@ MrcMr::MrcMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] bool isD
     if (isCuMemMapAllocated(buff)) {
       throw Error("Native MRC VMM registration requires DMA-BUF support", ErrorCode::InvalidUsage);
     }
+    checkGpuDmaTopology(device, nicPath);
     if (::access("/sys/module/nvidia_peermem", F_OK) != 0) {
       throw Error("nvidia_peermem kernel module is not loaded", ErrorCode::SystemError);
     }
@@ -138,7 +161,19 @@ uint32_t MrcMr::getLkey() const { return mr_->lkey; }
 
 MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port, int gidIndex, uint64_t evProfileId,
              int maxSendCqSize, int maxSendWr, int maxRecvWr)
-    : portNum_(port), gidIndex_(gidIndex), info_{}, sendCq_(nullptr), recvCq_(nullptr), qp_(nullptr) {
+    : portNum_(port),
+      gidIndex_(gidIndex),
+      info_{},
+      sendCq_(nullptr),
+      recvCq_(nullptr),
+      qp_(nullptr),
+      numStagedSend_(0),
+      numStagedSignaledSend_(0),
+      numPostedSignaledSend_(0),
+      numSendWcs_(0),
+      sendFailed_(false),
+      maxSendCqSize_(maxSendCqSize),
+      maxSendWr_(maxSendWr) {
   if (maxSendCqSize <= 0 || maxSendWr <= 0 || maxRecvWr < 0) {
     throw Error("Native MRC requires positive send CQ/WR limits and a nonnegative receive WR limit",
                 ErrorCode::InvalidUsage);
@@ -146,6 +181,10 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
   if (port <= 0 || port > 255) {
     throw Error("Native MRC requires a port between 1 and 255", ErrorCode::InvalidUsage);
   }
+
+  sendWcs_ = std::make_unique<ibv_wc[]>(maxSendCqSize_);
+  sendWrs_ = std::make_unique<ibv_send_wr[]>(maxSendWr_);
+  sendSges_ = std::make_unique<ibv_sge[]>(maxSendWr_);
 
   std::unique_ptr<mrc_cq, decltype(&mrc_destroy_cq)> sendCq(
       mrc_create_cq(mrcContext, maxSendCqSize, nullptr, nullptr, 0), mrc_destroy_cq);
@@ -275,8 +314,88 @@ void MrcQp::rts() {
   }
 }
 
-MrcCtx::MrcCtx(const std::string& devName)
-    : devName_(devName), context_(nullptr), pd_(nullptr), mrcContext_(nullptr), isDataDirect_(false) {
+void MrcQp::stageSendWrite(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
+                           uint64_t dstOffset, bool signaled) {
+  if (sendFailed_) {
+    throw Error("Native MRC send posting previously failed; create a new QP", ErrorCode::InvalidUsage);
+  }
+  if (mr == nullptr || numStagedSend_ >= maxSendWr_) {
+    throw Error("Native MRC WRITE requires an MR and space for a staged work request", ErrorCode::InvalidUsage);
+  }
+  if (signaled && numPostedSignaledSend_ + numStagedSignaledSend_ >= maxSendCqSize_) {
+    throw Error("Native MRC send CQ is full; poll completions before staging another signal", ErrorCode::InvalidUsage);
+  }
+  auto& wr = sendWrs_[numStagedSend_];
+  auto& sge = sendSges_[numStagedSend_];
+  wr = {};
+  sge.addr = reinterpret_cast<uint64_t>(mr->getBuff()) + srcOffset;
+  sge.length = size;
+  sge.lkey = mr->getLkey();
+  wr.wr_id = wrId;
+  wr.sg_list = &sge;
+  wr.num_sge = 1;
+  wr.opcode = IBV_WR_RDMA_WRITE;
+  wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
+  wr.wr.rdma.remote_addr = info.addr + dstOffset;
+  wr.wr.rdma.rkey = info.rkey;
+  if (numStagedSend_ > 0) {
+    sendWrs_[numStagedSend_ - 1].next = &wr;
+  }
+  ++numStagedSend_;
+  if (signaled) ++numStagedSignaledSend_;
+}
+
+void MrcQp::postSend() {
+  if (sendFailed_) {
+    throw Error("Native MRC send posting previously failed; create a new QP", ErrorCode::InvalidUsage);
+  }
+  if (numStagedSend_ == 0) return;
+  ibv_send_wr* badWr = nullptr;
+  int ret = mrc_post_send(qp_, sendWrs_.get(), &badWr);
+  int error = ret > 0 ? ret : errno;
+  if (ret == 0) {
+    numPostedSignaledSend_ += numStagedSignaledSend_;
+  } else {
+    // A failed post can submit a prefix. Account for it, but never replay the batch.
+    if (badWr != nullptr) {
+      for (auto* wr = sendWrs_.get(); wr != nullptr && wr != badWr; wr = wr->next) {
+        if (wr->send_flags & IBV_SEND_SIGNALED) ++numPostedSignaledSend_;
+      }
+    }
+    sendFailed_ = true;
+  }
+  numStagedSend_ = 0;
+  numStagedSignaledSend_ = 0;
+  if (ret != 0) {
+    throw IbError("mrc_post_send failed", error);
+  }
+}
+
+
+int MrcQp::pollSendCq() {
+  int count = mrc_poll_cq(sendCq_, maxSendCqSize_, sendWcs_.get());
+  numSendWcs_ = std::max(count, 0);
+  if (count > 0) {
+    // Failed unsignaled WRs can also produce completions.
+    numPostedSignaledSend_ = std::max(numPostedSignaledSend_ - count, 0);
+  }
+  return count;
+}
+
+int MrcQp::getSendWcStatus(int idx) const {
+  if (idx < 0 || idx >= numSendWcs_) {
+    throw Error("Invalid native MRC send completion index", ErrorCode::InvalidUsage);
+  }
+  return sendWcs_[idx].status;
+}
+
+std::string MrcQp::getSendWcStatusString(int idx) const {
+  return ibv_wc_status_str(static_cast<ibv_wc_status>(getSendWcStatus(idx)));
+}
+
+int MrcQp::getNumSendCqItems() const { return numPostedSignaledSend_; }
+
+MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr), pd_(nullptr), mrcContext_(nullptr) {
   if (devName.empty()) {
     throw Error("Native MRC requires a device name", ErrorCode::InvalidUsage);
   }
@@ -314,7 +433,9 @@ MrcCtx::MrcCtx(const std::string& devName)
 #if defined(MSCCLPP_USE_MLX5DV)
   if (MLX5DV::isAvailable() && MLX5DV::mlx5dv_is_supported(context->device)) {
     char sysfsPath[256];
-    isDataDirect_ = MLX5DV::mlx5dv_get_data_direct_sysfs_path(context.get(), sysfsPath, sizeof(sysfsPath)) == 0;
+    if (MLX5DV::mlx5dv_get_data_direct_sysfs_path(context.get(), sysfsPath, sizeof(sysfsPath)) == 0) {
+      dataDirectPath_ = std::string("/sys") + sysfsPath;
+    }
   }
 #endif
 
@@ -350,7 +471,7 @@ std::shared_ptr<MrcQp> MrcCtx::createQp(int port, int gidIndex, uint64_t evProfi
 }
 
 std::unique_ptr<const MrcMr> MrcCtx::registerMr(void* buff, std::size_t size) {
-  return std::unique_ptr<const MrcMr>(new MrcMr(pd_, buff, size, isDataDirect_));
+  return std::unique_ptr<const MrcMr>(new MrcMr(pd_, buff, size, dataDirectPath_));
 }
 
 }  // namespace mscclpp

@@ -14,6 +14,9 @@
 struct ibv_context;
 struct ibv_pd;
 struct ibv_mr;
+struct ibv_wc;
+struct ibv_send_wr;
+struct ibv_sge;
 struct mrc_context;
 struct mrc_cq;
 struct mrc_qp;
@@ -36,7 +39,7 @@ class MrcMr {
   uint32_t getLkey() const;
 
  private:
-  MrcMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect);
+  MrcMr(ibv_pd* pd, void* buff, std::size_t size, const std::string& dataDirectPath);
 
   ibv_mr* mr_;
   void* buff_;
@@ -63,8 +66,15 @@ class MrcQp {
 
   void rtr(const MrcQpInfo& info);
   void rts();
+  void stageSendWrite(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
+                      uint64_t dstOffset, bool signaled);
+  void postSend();
+  int pollSendCq();
 
   MrcQpInfo& getInfo() { return info_; }
+  int getSendWcStatus(int idx) const;
+  std::string getSendWcStatusString(int idx) const;
+  int getNumSendCqItems() const;
 
  private:
   MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port, int gidIndex, uint64_t evProfileId,
@@ -77,6 +87,16 @@ class MrcQp {
   mrc_cq* sendCq_;
   mrc_cq* recvCq_;
   mrc_qp* qp_;
+  std::unique_ptr<ibv_wc[]> sendWcs_;
+  std::unique_ptr<ibv_send_wr[]> sendWrs_;
+  std::unique_ptr<ibv_sge[]> sendSges_;
+  int numStagedSend_;
+  int numStagedSignaledSend_;
+  int numPostedSignaledSend_;
+  int numSendWcs_;
+  bool sendFailed_;
+  const int maxSendCqSize_;
+  const int maxSendWr_;
 
   friend class MrcCtx;
 };
@@ -101,7 +121,7 @@ class MrcCtx {
   ibv_context* context_;
   ibv_pd* pd_;
   mrc_context* mrcContext_;
-  bool isDataDirect_;
+  std::string dataDirectPath_;
 };
 
 }  // namespace mscclpp
