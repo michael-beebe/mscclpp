@@ -5,6 +5,7 @@
 
 #if defined(MSCCLPP_USE_MRC)
 
+#include <arpa/inet.h>
 #include <mrc.h>
 #include <unistd.h>
 
@@ -172,8 +173,13 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
       numPostedSignaledSend_(0),
       numSendWcs_(0),
       sendFailed_(false),
+      numStagedRecv_(0),
+      numPostedRecv_(0),
+      numRecvWcs_(0),
+      recvFailed_(false),
       maxSendCqSize_(maxSendCqSize),
-      maxSendWr_(maxSendWr) {
+      maxSendWr_(maxSendWr),
+      maxRecvWr_(maxRecvWr) {
   if (maxSendCqSize <= 0 || maxSendWr <= 0 || maxRecvWr < 0) {
     throw Error("Native MRC requires positive send CQ/WR limits and a nonnegative receive WR limit",
                 ErrorCode::InvalidUsage);
@@ -194,6 +200,8 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
 
   std::unique_ptr<mrc_cq, decltype(&mrc_destroy_cq)> recvCq(nullptr, mrc_destroy_cq);
   if (maxRecvWr > 0) {
+    recvWcs_ = std::make_unique<ibv_wc[]>(maxRecvWr_);
+    recvWrs_ = std::make_unique<ibv_recv_wr[]>(maxRecvWr_);
     recvCq.reset(mrc_create_cq(mrcContext, maxRecvWr, nullptr, nullptr, 0));
     if (!recvCq) {
       throw MrcError("mrc_create_cq failed for receive CQ", errno);
@@ -316,11 +324,27 @@ void MrcQp::rts() {
 
 void MrcQp::stageSendWrite(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
                            uint64_t dstOffset, bool signaled) {
+  if (mr == nullptr) {
+    throw Error("Native MRC WRITE requires an MR", ErrorCode::InvalidUsage);
+  }
+  stageSend(mr, info, size, wrId, srcOffset, dstOffset, signaled);
+}
+
+void MrcQp::stageSendWriteWithImm(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId,
+                                  uint64_t srcOffset, uint64_t dstOffset, bool signaled, unsigned int immData) {
+  auto& wr = stageSend(mr, info, size, wrId, srcOffset, dstOffset, signaled);
+  wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
+  wr.imm_data = htonl(immData);
+}
+
+ibv_send_wr& MrcQp::stageSend(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
+                              uint64_t dstOffset, bool signaled) {
   if (sendFailed_) {
     throw Error("Native MRC send posting previously failed; create a new QP", ErrorCode::InvalidUsage);
   }
-  if (mr == nullptr || numStagedSend_ >= maxSendWr_) {
-    throw Error("Native MRC WRITE requires an MR and space for a staged work request", ErrorCode::InvalidUsage);
+  if ((mr == nullptr && size != 0) || numStagedSend_ >= maxSendWr_) {
+    throw Error("Native MRC WRITE requires an MR for nonzero size and space for a staged work request",
+                ErrorCode::InvalidUsage);
   }
   if (signaled && numPostedSignaledSend_ + numStagedSignaledSend_ >= maxSendCqSize_) {
     throw Error("Native MRC send CQ is full; poll completions before staging another signal", ErrorCode::InvalidUsage);
@@ -328,12 +352,14 @@ void MrcQp::stageSendWrite(const MrcMr* mr, const MrcMrInfo& info, uint32_t size
   auto& wr = sendWrs_[numStagedSend_];
   auto& sge = sendSges_[numStagedSend_];
   wr = {};
-  sge.addr = reinterpret_cast<uint64_t>(mr->getBuff()) + srcOffset;
-  sge.length = size;
-  sge.lkey = mr->getLkey();
+  if (mr != nullptr) {
+    sge.addr = reinterpret_cast<uint64_t>(mr->getBuff()) + srcOffset;
+    sge.length = size;
+    sge.lkey = mr->getLkey();
+  }
   wr.wr_id = wrId;
-  wr.sg_list = &sge;
-  wr.num_sge = 1;
+  wr.sg_list = mr != nullptr ? &sge : nullptr;
+  wr.num_sge = mr != nullptr ? 1 : 0;
   wr.opcode = IBV_WR_RDMA_WRITE;
   wr.send_flags = signaled ? IBV_SEND_SIGNALED : 0;
   wr.wr.rdma.remote_addr = info.addr + dstOffset;
@@ -343,6 +369,7 @@ void MrcQp::stageSendWrite(const MrcMr* mr, const MrcMrInfo& info, uint32_t size
   }
   ++numStagedSend_;
   if (signaled) ++numStagedSignaledSend_;
+  return wr;
 }
 
 void MrcQp::postSend() {
@@ -371,6 +398,47 @@ void MrcQp::postSend() {
   }
 }
 
+void MrcQp::stageRecv(uint64_t wrId) {
+  if (recvFailed_) {
+    throw Error("Native MRC receive posting previously failed; create a new QP", ErrorCode::InvalidUsage);
+  }
+  if (numStagedRecv_ + numPostedRecv_ >= maxRecvWr_) {
+    throw Error("Native MRC receive queue is full or disabled; poll completions before staging another receive",
+                ErrorCode::InvalidUsage);
+  }
+  auto& wr = recvWrs_[numStagedRecv_];
+  wr = {};
+  wr.wr_id = wrId;
+  if (numStagedRecv_ > 0) {
+    recvWrs_[numStagedRecv_ - 1].next = &wr;
+  }
+  ++numStagedRecv_;
+}
+
+void MrcQp::postRecv() {
+  if (recvFailed_) {
+    throw Error("Native MRC receive posting previously failed; create a new QP", ErrorCode::InvalidUsage);
+  }
+  if (numStagedRecv_ == 0) return;
+  ibv_recv_wr* badWr = nullptr;
+  int ret = mrc_post_recv(qp_, recvWrs_.get(), &badWr);
+  int error = ret > 0 ? ret : errno;
+  if (ret == 0) {
+    numPostedRecv_ += numStagedRecv_;
+  } else {
+    // As with sends, a failed post may have accepted a prefix.
+    if (badWr != nullptr) {
+      for (auto* wr = recvWrs_.get(); wr != nullptr && wr != badWr; wr = wr->next) {
+        ++numPostedRecv_;
+      }
+    }
+    recvFailed_ = true;
+  }
+  numStagedRecv_ = 0;
+  if (ret != 0) {
+    throw MrcError("mrc_post_recv failed", error);
+  }
+}
 
 int MrcQp::pollSendCq() {
   int count = mrc_poll_cq(sendCq_, maxSendCqSize_, sendWcs_.get());
@@ -379,6 +447,14 @@ int MrcQp::pollSendCq() {
     // Failed unsignaled WRs can also produce completions.
     numPostedSignaledSend_ = std::max(numPostedSignaledSend_ - count, 0);
   }
+  return count;
+}
+
+int MrcQp::pollRecvCq() {
+  if (recvCq_ == nullptr) return 0;
+  int count = mrc_poll_cq(recvCq_, maxRecvWr_, recvWcs_.get());
+  numRecvWcs_ = std::max(count, 0);
+  if (count > 0) numPostedRecv_ = std::max(numPostedRecv_ - count, 0);
   return count;
 }
 
@@ -394,6 +470,24 @@ std::string MrcQp::getSendWcStatusString(int idx) const {
 }
 
 int MrcQp::getNumSendCqItems() const { return numPostedSignaledSend_; }
+
+int MrcQp::getRecvWcStatus(int idx) const {
+  if (idx < 0 || idx >= numRecvWcs_) {
+    throw Error("Invalid native MRC receive completion index", ErrorCode::InvalidUsage);
+  }
+  return recvWcs_[idx].status;
+}
+
+std::string MrcQp::getRecvWcStatusString(int idx) const {
+  return ibv_wc_status_str(static_cast<ibv_wc_status>(getRecvWcStatus(idx)));
+}
+
+unsigned int MrcQp::getRecvWcImmData(int idx) const {
+  if (getRecvWcStatus(idx) != IBV_WC_SUCCESS || !(recvWcs_[idx].wc_flags & IBV_WC_WITH_IMM)) {
+    throw Error("Native MRC receive completion has no valid immediate data", ErrorCode::InvalidUsage);
+  }
+  return ntohl(recvWcs_[idx].imm_data);
+}
 
 MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr), pd_(nullptr), mrcContext_(nullptr) {
   if (devName.empty()) {

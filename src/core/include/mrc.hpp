@@ -16,6 +16,7 @@ struct ibv_pd;
 struct ibv_mr;
 struct ibv_wc;
 struct ibv_send_wr;
+struct ibv_recv_wr;
 struct ibv_sge;
 struct mrc_context;
 struct mrc_cq;
@@ -68,17 +69,27 @@ class MrcQp {
   void rts();
   void stageSendWrite(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
                       uint64_t dstOffset, bool signaled);
+  void stageSendWriteWithImm(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
+                             uint64_t dstOffset, bool signaled, unsigned int immData);
   void postSend();
+  void stageRecv(uint64_t wrId);
+  void postRecv();
   int pollSendCq();
+  int pollRecvCq();
 
   MrcQpInfo& getInfo() { return info_; }
   int getSendWcStatus(int idx) const;
   std::string getSendWcStatusString(int idx) const;
   int getNumSendCqItems() const;
+  int getRecvWcStatus(int idx) const;
+  std::string getRecvWcStatusString(int idx) const;
+  unsigned int getRecvWcImmData(int idx) const;
 
  private:
   MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port, int gidIndex, uint64_t evProfileId,
         int maxSendCqSize, int maxSendWr, int maxRecvWr);
+  ibv_send_wr& stageSend(const MrcMr* mr, const MrcMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
+                         uint64_t dstOffset, bool signaled);
 
   int portNum_;
   int gidIndex_;
@@ -90,13 +101,20 @@ class MrcQp {
   std::unique_ptr<ibv_wc[]> sendWcs_;
   std::unique_ptr<ibv_send_wr[]> sendWrs_;
   std::unique_ptr<ibv_sge[]> sendSges_;
+  std::unique_ptr<ibv_wc[]> recvWcs_;
+  std::unique_ptr<ibv_recv_wr[]> recvWrs_;
   int numStagedSend_;
   int numStagedSignaledSend_;
   int numPostedSignaledSend_;
   int numSendWcs_;
   bool sendFailed_;
+  int numStagedRecv_;
+  int numPostedRecv_;
+  int numRecvWcs_;
+  bool recvFailed_;
   const int maxSendCqSize_;
   const int maxSendWr_;
+  const int maxRecvWr_;
 
   friend class MrcCtx;
 };
