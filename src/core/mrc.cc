@@ -131,7 +131,7 @@ MrcMr::MrcMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] const st
         mr_ = ibv_reg_dmabuf_mr(pd, offset, size, bufferAddress, fd, accessFlags);
       }
       if (mr_ == nullptr) {
-        throw IbError("DMA-BUF registration failed for native MRC", errno);
+        throw MrcError("DMA-BUF registration failed for native MRC", errno);
       }
       return;
     }
@@ -147,7 +147,7 @@ MrcMr::MrcMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] const st
 
   mr_ = ibv_reg_mr(pd, reinterpret_cast<void*>(address), rangeSize, accessFlags);
   if (mr_ == nullptr) {
-    throw IbError("ibv_reg_mr failed for native MRC", errno);
+    throw MrcError("ibv_reg_mr failed for native MRC", errno);
   }
 }
 
@@ -189,14 +189,14 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
   std::unique_ptr<mrc_cq, decltype(&mrc_destroy_cq)> sendCq(
       mrc_create_cq(mrcContext, maxSendCqSize, nullptr, nullptr, 0), mrc_destroy_cq);
   if (!sendCq) {
-    throw IbError("mrc_create_cq failed for send CQ", errno);
+    throw MrcError("mrc_create_cq failed for send CQ", errno);
   }
 
   std::unique_ptr<mrc_cq, decltype(&mrc_destroy_cq)> recvCq(nullptr, mrc_destroy_cq);
   if (maxRecvWr > 0) {
     recvCq.reset(mrc_create_cq(mrcContext, maxRecvWr, nullptr, nullptr, 0));
     if (!recvCq) {
-      throw IbError("mrc_create_cq failed for receive CQ", errno);
+      throw MrcError("mrc_create_cq failed for receive CQ", errno);
     }
   }
 
@@ -210,13 +210,13 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
   attrs.pd = pd;
   std::unique_ptr<mrc_qp, decltype(&mrc_destroy_qp)> qp(mrc_create_qp(mrcContext, &attrs), mrc_destroy_qp);
   if (!qp) {
-    throw IbError("mrc_create_qp failed", errno);
+    throw MrcError("mrc_create_qp failed", errno);
   }
 
   ibv_port_attr portAttr{};
   int ret = ibv_query_port(context, portNum_, &portAttr);
   if (ret != 0) {
-    throw IbError("ibv_query_port failed for native MRC QP", ret > 0 ? ret : errno);
+    throw MrcError("ibv_query_port failed for native MRC QP", ret > 0 ? ret : errno);
   }
   info_.lid = portAttr.lid;
   info_.linkLayer = portAttr.link_layer;
@@ -225,7 +225,7 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
 
   ret = mrc_get_qpn(qp.get(), &info_.qpn);
   if (ret != 0) {
-    throw IbError("mrc_get_qpn failed", ret > 0 ? ret : errno);
+    throw MrcError("mrc_get_qpn failed", ret > 0 ? ret : errno);
   }
 
   if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND || info_.isGrh) {
@@ -237,7 +237,7 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
     ibv_gid gid{};
     ret = ibv_query_gid(context, portNum_, gidIndex_, &gid);
     if (ret != 0) {
-      throw IbError("ibv_query_gid failed for native MRC QP", ret > 0 ? ret : errno);
+      throw MrcError("ibv_query_gid failed for native MRC QP", ret > 0 ? ret : errno);
     }
     info_.spn = gid.global.subnet_prefix;
     info_.iid = gid.global.interface_id;
@@ -254,7 +254,7 @@ MrcQp::MrcQp(ibv_context* context, mrc_context* mrcContext, ibv_pd* pd, int port
   ret = mrc_modify_qp(qp.get(), &qpAttrs, IBV_QP_STATE | IBV_QP_PORT | IBV_QP_PKEY_INDEX | IBV_QP_ACCESS_FLAGS,
                       &mrcAttrs, MRC_QP_EV_PROFILE_ID);
   if (ret != 0) {
-    throw IbError("mrc_modify_qp failed transitioning to INIT", ret > 0 ? ret : errno);
+    throw MrcError("mrc_modify_qp failed transitioning to INIT", ret > 0 ? ret : errno);
   }
 
   sendCq_ = sendCq.release();
@@ -293,7 +293,7 @@ void MrcQp::rtr(const MrcQpInfo& info) {
   int ret = mrc_modify_qp(qp_, &qpAttrs, IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN,
                           &mrcAttrs, MRC_QP_PROTOCOL_VERSION);
   if (ret != 0) {
-    throw IbError("mrc_modify_qp failed transitioning to RTR", ret > 0 ? ret : errno);
+    throw MrcError("mrc_modify_qp failed transitioning to RTR", ret > 0 ? ret : errno);
   }
 }
 
@@ -310,7 +310,7 @@ void MrcQp::rts() {
   int ret = mrc_modify_qp(qp_, &qpAttrs, IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY, &mrcAttrs,
                           MRC_QP_TIMEOUT);
   if (ret != 0) {
-    throw IbError("mrc_modify_qp failed transitioning to RTS", ret > 0 ? ret : errno);
+    throw MrcError("mrc_modify_qp failed transitioning to RTS", ret > 0 ? ret : errno);
   }
 }
 
@@ -367,7 +367,7 @@ void MrcQp::postSend() {
   numStagedSend_ = 0;
   numStagedSignaledSend_ = 0;
   if (ret != 0) {
-    throw IbError("mrc_post_send failed", error);
+    throw MrcError("mrc_post_send failed", error);
   }
 }
 
@@ -404,14 +404,14 @@ MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr
   std::unique_ptr<ibv_device*, decltype(&ibv_free_device_list)> devices(ibv_get_device_list(&numDevices),
                                                                         ibv_free_device_list);
   if (!devices) {
-    throw IbError("ibv_get_device_list failed", errno);
+    throw MrcError("ibv_get_device_list failed", errno);
   }
   std::unique_ptr<ibv_context, decltype(&ibv_close_device)> context(nullptr, ibv_close_device);
   for (int i = 0; i < numDevices; ++i) {
     if (devName == ibv_get_device_name(devices.get()[i])) {
       context.reset(ibv_open_device(devices.get()[i]));
       if (!context) {
-        throw IbError("ibv_open_device failed for " + devName, errno);
+        throw MrcError("ibv_open_device failed for " + devName, errno);
       }
       break;
     }
@@ -424,7 +424,7 @@ MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr
   mrc_attr capabilities{};
   int supported = 0;
   if (mrc_query_device(context.get(), &capabilities, &supported) != 0) {
-    throw IbError("mrc_query_device failed for " + devName, errno);
+    throw MrcError("mrc_query_device failed for " + devName, errno);
   }
   if (!supported) {
     throw Error("Device does not support native MRC: " + devName, ErrorCode::InvalidUsage);
@@ -441,7 +441,7 @@ MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr
 
   std::unique_ptr<ibv_pd, decltype(&ibv_dealloc_pd)> pd(ibv_alloc_pd(context.get()), ibv_dealloc_pd);
   if (!pd) {
-    throw IbError("ibv_alloc_pd failed for " + devName, errno);
+    throw MrcError("ibv_alloc_pd failed for " + devName, errno);
   }
 
   // TODO: Add runtime compatibility checks with mrc_query_version when the SDK provides it.
@@ -450,7 +450,7 @@ MrcCtx::MrcCtx(const std::string& devName) : devName_(devName), context_(nullptr
   std::unique_ptr<mrc_context, decltype(&mrc_destroy_context)> mrcContext(mrc_create_context(context.get(), &attrs),
                                                                           mrc_destroy_context);
   if (!mrcContext) {
-    throw IbError("mrc_create_context failed for " + devName, errno);
+    throw MrcError("mrc_create_context failed for " + devName, errno);
   }
 
   context_ = context.release();
