@@ -11,6 +11,7 @@
 #include "communicator.hpp"
 #include "gpu_ipc_mem.hpp"
 #include "ib.hpp"
+#include "mrc.hpp"
 
 namespace mscclpp {
 
@@ -18,13 +19,26 @@ struct TransportInfo {
   Transport transport;
 
   // TODO: rewrite this using std::variant or something
+#if defined(MSCCLPP_USE_IB)
   bool ibLocal;
+#endif
+#if defined(MSCCLPP_USE_MRC)
+  bool mrcLocal;
+#endif
   union {
     GpuIpcMemHandle gpuIpcMemHandle;
+#if defined(MSCCLPP_USE_IB)
     struct {
       const IbMr* ibMr;
       IbMrInfo ibMrInfo;
     };
+#endif
+#if defined(MSCCLPP_USE_MRC)
+    struct {
+      const MrcMr* mrcMr;
+      MrcMrInfo mrcMrInfo;
+    };
+#endif
   };
 };
 
@@ -45,7 +59,12 @@ struct RegisteredMemory::Impl {
   std::shared_ptr<void> remoteMemMap;
 
   // Only used for IB transport
+#if defined(MSCCLPP_USE_IB)
   std::unordered_map<Transport, std::unique_ptr<const IbMr>> ibMrMap;
+#endif
+#if defined(MSCCLPP_USE_MRC)
+  std::unordered_map<Transport, std::unique_ptr<const MrcMr>> mrcMrMap;
+#endif
 
   Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl);
   Impl(const std::vector<char>::const_iterator& begin, const std::vector<char>::const_iterator& end);

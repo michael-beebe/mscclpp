@@ -51,6 +51,7 @@ void CudaIpcStream::sync() {
 }
 
 IbCtx* Context::Impl::getIbContext(Transport ibTransport) {
+#if defined(MSCCLPP_USE_IB)
   // Find IB context or create it
   auto it = ibContexts_.find(ibTransport);
   if (it == ibContexts_.end()) {
@@ -59,6 +60,9 @@ IbCtx* Context::Impl::getIbContext(Transport ibTransport) {
     return ibContexts_[ibTransport].get();
   }
   return it->second.get();
+#else
+  THROW(CONN, Error, ErrorCode::InvalidUsage, "IB support is disabled (requested ", ibTransport, ")");
+#endif
 }
 
 std::shared_ptr<uint64_t> Context::Impl::getToken() {
@@ -66,6 +70,22 @@ std::shared_ptr<uint64_t> Context::Impl::getToken() {
     tokenPool_ = std::make_shared<TokenPool>(maxNumTokens_);
   }
   return tokenPool_->getToken();
+}
+
+MrcCtx* Context::Impl::getMrcContext(Transport transport) {
+  if (!AllMrcTransports.has(transport)) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "Not a native MRC transport");
+  }
+#if defined(MSCCLPP_USE_MRC)
+  auto it = mrcContexts_.find(transport);
+  if (it == mrcContexts_.end()) {
+    auto context = std::make_unique<MrcCtx>(getMrcDeviceName(transport));
+    it = mrcContexts_.emplace(transport, std::move(context)).first;
+  }
+  return it->second.get();
+#else
+  THROW(CONN, Error, ErrorCode::InvalidUsage, "Native MRC support is disabled");
+#endif
 }
 
 MSCCLPP_API_CPP Context::Context() : pimpl_(std::make_unique<Impl>()) {}
@@ -89,6 +109,16 @@ MSCCLPP_API_CPP Connection Context::connect(const Endpoint& localEndpoint, const
   }
   auto localTransport = localEndpoint.transport();
   auto remoteTransport = remoteEndpoint.transport();
+  if (AllMrcTransports.has(localTransport) || AllMrcTransports.has(remoteTransport)) {
+    if (!AllMrcTransports.has(localTransport) || !AllMrcTransports.has(remoteTransport)) {
+      THROW(CONN, Error, ErrorCode::InvalidUsage, "Native MRC cannot connect to another transport family");
+    }
+#if defined(MSCCLPP_USE_MRC)
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "Native MRC connections are not implemented yet");
+#else
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "Native MRC support is disabled");
+#endif
+  }
   if (localTransport != remoteTransport &&
       !(AllIBTransports.has(localTransport) && AllIBTransports.has(remoteTransport))) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "Transport mismatch between local (", localTransport, ") and remote (",
@@ -98,7 +128,11 @@ MSCCLPP_API_CPP Connection Context::connect(const Endpoint& localEndpoint, const
   if (localTransport == Transport::CudaIpc) {
     conn = std::make_shared<CudaIpcConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
   } else if (AllIBTransports.has(localTransport)) {
+#if defined(MSCCLPP_USE_IB)
     conn = std::make_shared<IBConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
+#else
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "IB support is disabled");
+#endif
   } else if (localTransport == Transport::Ethernet) {
     conn = std::make_shared<EthernetConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
   } else {

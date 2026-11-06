@@ -17,12 +17,46 @@
 
 namespace mscclpp {
 
+#if defined(MSCCLPP_USE_MRC)
+static void validateMrcConfig(const EndpointConfig& config) {
+  const auto& mrc = config.mrc;
+  if (mrc.port <= 0 || mrc.port > 255 || mrc.gidIndex < 0 || mrc.maxCqSize <= 0 || mrc.maxSendWr <= 0 ||
+      mrc.maxRecvWr < 0 || config.maxWriteQueueSize <= 0) {
+    throw Error("Invalid native MRC endpoint configuration", ErrorCode::InvalidUsage);
+  }
+}
+#endif
+
 Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
     : config_(config), hostHash_(getHostHash()), pidHash_(getPidHash()) {
+#if !defined(MSCCLPP_USE_IB)
+  if (AllIBTransports.has(config_.transport)) {
+    throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+  }
+#endif
+#if !defined(MSCCLPP_USE_MRC)
+  if (AllMrcTransports.has(config_.transport)) {
+    throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+  }
+#endif
   if (config_.device.type == DeviceType::GPU && config_.device.id < 0) {
     MSCCLPP_CUDATHROW(cudaGetDevice(&(config_.device.id)));
   }
-  if (AllIBTransports.has(config_.transport)) {
+  if (AllMrcTransports.has(config_.transport)) {
+#if defined(MSCCLPP_USE_MRC)
+    if (config_.maxWriteQueueSize <= 0) config_.maxWriteQueueSize = config_.mrc.maxCqSize;
+    if (config_.mrc.gidIndex < 0) config_.mrc.gidIndex = env()->ibGidIndex;
+    validateMrcConfig(config_);
+    mrcLocal_ = true;
+    mrcQp_ = contextImpl.getMrcContext(config_.transport)
+                 ->createQp(config_.mrc.port, config_.mrc.gidIndex, config_.mrc.evProfileId, config_.mrc.maxCqSize,
+                            config_.mrc.maxSendWr, config_.mrc.maxRecvWr);
+    mrcQpInfo_ = mrcQp_->getInfo();
+#else
+    throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+#endif
+  } else if (AllIBTransports.has(config_.transport)) {
+#if defined(MSCCLPP_USE_IB)
     ibLocal_ = true;
     if (config_.maxWriteQueueSize <= 0) {
       config_.maxWriteQueueSize = config_.ib.maxCqSize;
@@ -58,6 +92,9 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
                 ->createQp(config_.ib.port, config_.ib.gidIndex, config_.ib.maxCqSize, config_.ib.maxCqPollNum,
                            config_.ib.maxSendWr, maxRecvWr, config_.ib.maxWrPerSend, ibNoAtomic_);
     ibQpInfo_ = ibQp_->getInfo();
+#else
+    throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+#endif
   } else if (config_.transport == Transport::Ethernet) {
     // Configuring Ethernet Interfaces
     abortFlag_ = 0;
@@ -72,15 +109,39 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
 }
 
 Endpoint::Impl::Impl(const std::vector<char>& serialization) {
+  if (serialization.size() < sizeof(config_) + sizeof(hostHash_) + sizeof(pidHash_)) {
+    throw Error("Truncated endpoint metadata", ErrorCode::InvalidUsage);
+  }
   auto it = serialization.begin();
   it = detail::deserialize(it, config_);
   it = detail::deserialize(it, hostHash_);
   it = detail::deserialize(it, pidHash_);
-  if (AllIBTransports.has(config_.transport)) {
+  if (AllMrcTransports.has(config_.transport)) {
+#if defined(MSCCLPP_USE_MRC)
+    validateMrcConfig(config_);
+    mrcLocal_ = false;
+    if (serialization.end() - it < static_cast<std::ptrdiff_t>(sizeof(mrcQpInfo_))) {
+      throw Error("Truncated native MRC endpoint metadata", ErrorCode::InvalidUsage);
+    }
+    it = detail::deserialize(it, mrcQpInfo_);
+#else
+    throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+#endif
+  } else if (AllIBTransports.has(config_.transport)) {
+#if defined(MSCCLPP_USE_IB)
     ibLocal_ = false;
+    if (serialization.end() - it < static_cast<std::ptrdiff_t>(sizeof(ibQpInfo_) + sizeof(ibNoAtomic_))) {
+      throw Error("Truncated IB endpoint metadata", ErrorCode::InvalidUsage);
+    }
     it = detail::deserialize(it, ibQpInfo_);
     it = detail::deserialize(it, ibNoAtomic_);
+#else
+    throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+#endif
   } else if (config_.transport == Transport::Ethernet) {
+    if (serialization.end() - it < static_cast<std::ptrdiff_t>(sizeof(socketAddress_))) {
+      throw Error("Truncated Ethernet endpoint metadata", ErrorCode::InvalidUsage);
+    }
     it = detail::deserialize(it, socketAddress_);
   }
   if (it != serialization.end()) {
@@ -107,9 +168,19 @@ MSCCLPP_API_CPP std::vector<char> Endpoint::serialize() const {
   detail::serialize(data, pimpl_->config_);
   detail::serialize(data, pimpl_->hostHash_);
   detail::serialize(data, pimpl_->pidHash_);
-  if (AllIBTransports.has(pimpl_->config_.transport)) {
+  if (AllMrcTransports.has(pimpl_->config_.transport)) {
+#if defined(MSCCLPP_USE_MRC)
+    detail::serialize(data, pimpl_->mrcQpInfo_);
+#else
+    throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+#endif
+  } else if (AllIBTransports.has(pimpl_->config_.transport)) {
+#if defined(MSCCLPP_USE_IB)
     detail::serialize(data, pimpl_->ibQpInfo_);
     detail::serialize(data, pimpl_->ibNoAtomic_);
+#else
+    throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+#endif
   } else if (pimpl_->config_.transport == Transport::Ethernet) {
     detail::serialize(data, pimpl_->socketAddress_);
   }

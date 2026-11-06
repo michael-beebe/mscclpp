@@ -249,6 +249,7 @@ void CudaIpcConnection::accumulate(RegisteredMemory dst, uint64_t dstOffset, [[m
 
 // IBConnection
 
+#if defined(MSCCLPP_USE_IB)
 void IBConnection::recvThreadFunc() {
   // Set the CUDA device context for this thread
   if (localGpuDeviceId_ >= 0) {
@@ -593,6 +594,8 @@ bool IBConnection::progressFlush() {
   }
   return qp->getNumSendCqItems() == 0;
 }
+
+#endif  // defined(MSCCLPP_USE_IB)
 
 // EthernetConnection
 

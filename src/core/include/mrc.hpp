@@ -24,6 +24,10 @@ struct mrc_qp;
 
 namespace mscclpp {
 
+enum class Transport;
+
+std::string getMrcDeviceName(Transport transport);
+
 struct MrcMrInfo {
   uint64_t addr;
   uint32_t rkey;

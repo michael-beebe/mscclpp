@@ -32,13 +32,31 @@
 
 namespace mscclpp {
 
-RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl)
+static void checkMemoryMetadataSize(std::vector<char>::const_iterator it, std::vector<char>::const_iterator end,
+                                    size_t size) {
+  if (end - it < static_cast<std::ptrdiff_t>(size)) {
+    throw Error("Truncated registered memory metadata", ErrorCode::InvalidUsage);
+  }
+}
+
+RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
+                             [[maybe_unused]] Context::Impl& contextImpl)
     : data(data),
       originalDataPtr(data),
       size(size),
       hostHash(getHostHash()),
       pidHash(getPidHash()),
       transports(transports) {
+#if !defined(MSCCLPP_USE_IB)
+  if ((transports & AllIBTransports).any()) {
+    throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+  }
+#endif
+#if !defined(MSCCLPP_USE_MRC)
+  if ((transports & AllMrcTransports).any()) {
+    throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+  }
+#endif
   if (transports.has(Transport::CudaIpc)) {
     CudaDeviceGuard deviceGuard(detail::gpuIdFromAddress(data));
 
@@ -48,6 +66,7 @@ RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
     transportInfo.gpuIpcMemHandle = *localGpuIpcMemHandle;
     this->transportInfos.emplace_back(transportInfo);
   }
+#if defined(MSCCLPP_USE_IB)
   if ((transports & AllIBTransports).any()) {
     auto addIb = [&](Transport ibTransport) {
       TransportInfo transportInfo;
@@ -68,6 +87,21 @@ RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
     if (transports.has(Transport::IB6)) addIb(Transport::IB6);
     if (transports.has(Transport::IB7)) addIb(Transport::IB7);
   }
+#endif
+#if defined(MSCCLPP_USE_MRC)
+  for (Transport transport : {Transport::MRC0, Transport::MRC1, Transport::MRC2, Transport::MRC3}) {
+    if (!transports.has(transport)) continue;
+    auto mr = contextImpl.getMrcContext(transport)->registerMr(data, size);
+    TransportInfo info{};
+    info.transport = transport;
+    info.mrcLocal = true;
+    info.mrcMr = mr.get();
+    info.mrcMrInfo = mr->getInfo();
+    mrcMrMap.emplace(transport, std::move(mr));
+    transportInfos.push_back(info);
+    INFO(NET, "Native MRC mr for address ", data, " with size ", size, " is registered");
+  }
+#endif
 }
 
 MSCCLPP_API_CPP RegisteredMemory::RegisteredMemory(std::shared_ptr<Impl> pimpl) : pimpl_(pimpl) {}
@@ -102,7 +136,17 @@ MSCCLPP_API_CPP std::vector<char> RegisteredMemory::serialize() const {
       }
       detail::serialize(result, entry.gpuIpcMemHandle);
     } else if (AllIBTransports.has(entry.transport)) {
+#if defined(MSCCLPP_USE_IB)
       detail::serialize(result, entry.ibMrInfo);
+#else
+      throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+#endif
+    } else if (AllMrcTransports.has(entry.transport)) {
+#if defined(MSCCLPP_USE_MRC)
+      detail::serialize(result, entry.mrcMrInfo);
+#else
+      throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+#endif
     } else {
       THROW(GPU, Error, ErrorCode::InternalError, "Unknown transport");
     }
@@ -117,25 +161,70 @@ MSCCLPP_API_CPP RegisteredMemory RegisteredMemory::deserialize(const std::vector
 RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
                              const std::vector<char>::const_iterator& end) {
   auto it = begin;
+  checkMemoryMetadataSize(it, end,
+                          sizeof(originalDataPtr) + sizeof(size) + sizeof(hostHash) + sizeof(pidHash) +
+                              sizeof(transports) + sizeof(int8_t));
   it = detail::deserialize(it, this->originalDataPtr);
   it = detail::deserialize(it, this->size);
   it = detail::deserialize(it, this->hostHash);
   it = detail::deserialize(it, this->pidHash);
   it = detail::deserialize(it, this->transports);
+#if !defined(MSCCLPP_USE_IB)
+  if ((this->transports & AllIBTransports).any()) {
+    throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+  }
+#endif
+#if !defined(MSCCLPP_USE_MRC)
+  if ((this->transports & AllMrcTransports).any()) {
+    throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+  }
+#endif
   int8_t transportCount;
   it = detail::deserialize(it, transportCount);
+  if (transportCount < 0) throw Error("Invalid transport record count", ErrorCode::InvalidUsage);
+  TransportFlags seenMrc;
   for (int i = 0; i < transportCount; ++i) {
-    TransportInfo transportInfo;
+    TransportInfo transportInfo{};
+    checkMemoryMetadataSize(it, end, sizeof(transportInfo.transport));
     it = detail::deserialize(it, transportInfo.transport);
+    if (static_cast<unsigned int>(transportInfo.transport) >= static_cast<unsigned int>(Transport::NumTransports)) {
+      throw Error("Invalid memory transport identity", ErrorCode::InvalidUsage);
+    }
     if (transportInfo.transport == Transport::CudaIpc) {
+      checkMemoryMetadataSize(it, end, sizeof(transportInfo.gpuIpcMemHandle));
       it = detail::deserialize(it, transportInfo.gpuIpcMemHandle);
     } else if (AllIBTransports.has(transportInfo.transport)) {
+#if defined(MSCCLPP_USE_IB)
+      checkMemoryMetadataSize(it, end, sizeof(transportInfo.ibMrInfo));
       it = detail::deserialize(it, transportInfo.ibMrInfo);
       transportInfo.ibLocal = false;
+#else
+      throw Error("IB support is disabled", ErrorCode::InvalidUsage);
+#endif
+    } else if (AllMrcTransports.has(transportInfo.transport)) {
+#if defined(MSCCLPP_USE_MRC)
+      if (!this->transports.has(transportInfo.transport) || seenMrc.has(transportInfo.transport)) {
+        throw Error("Unexpected or duplicate native MRC memory record", ErrorCode::InvalidUsage);
+      }
+      checkMemoryMetadataSize(it, end, sizeof(transportInfo.mrcMrInfo));
+      it = detail::deserialize(it, transportInfo.mrcMrInfo);
+      if (this->size == 0 || transportInfo.mrcMrInfo.addr == 0 ||
+          transportInfo.mrcMrInfo.addr != reinterpret_cast<uintptr_t>(this->originalDataPtr) ||
+          this->size > std::numeric_limits<uint64_t>::max() - transportInfo.mrcMrInfo.addr) {
+        throw Error("Invalid native MRC memory range", ErrorCode::InvalidUsage);
+      }
+      transportInfo.mrcLocal = false;
+      seenMrc |= transportInfo.transport;
+#else
+      throw Error("Native MRC support is disabled", ErrorCode::InvalidUsage);
+#endif
     } else {
       throw Error("Unknown transport", ErrorCode::InternalError);
     }
     this->transportInfos.emplace_back(transportInfo);
+  }
+  if (seenMrc != (this->transports & AllMrcTransports)) {
+    throw Error("Missing native MRC memory records", ErrorCode::InvalidUsage);
   }
   if (it != end) {
     throw Error("Serialization failed", ErrorCode::InternalError);
@@ -161,23 +250,24 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
       }
     }
   } else if (transports.has(Transport::CudaIpc)) {
-    // When transports include both CudaIpc and IB (e.g., CudaIpc | IB0),
-    // try CudaIpc first and fall back to IB on failure.
+    // When IPC and RDMA metadata coexist, try IPC first and retain RDMA on import failure.
     auto entry = getTransportInfo(Transport::CudaIpc);
     bool hasIB = (transports & AllIBTransports).any();
+    bool hasMrc = (transports & AllMrcTransports).any();
     try {
       auto gpuIpcMem = GpuIpcMem::create(entry.gpuIpcMemHandle);
       this->remoteMemMap = gpuIpcMem->map();
       this->data = this->remoteMemMap.get();
     } catch (const BaseError& e) {
-      if (!hasIB) {
+      if (!hasIB && !hasMrc) {
         throw;
       }
       bool isSameHost = (getHostHash() == this->hostHash);
+      std::string fallback = hasIB ? "IB" : "native MRC";
       if (isSameHost) {
-        WARN(GPU, "CudaIpc import failed on same host, falling back to IB transport: ", e.what());
+        WARN(GPU, "CudaIpc import failed on same host, falling back to ", fallback, " transport: ", e.what());
       } else {
-        INFO(GPU, "CudaIpc import failed on remote host, falling back to IB transport: ", e.what());
+        INFO(GPU, "CudaIpc import failed on remote host, falling back to ", fallback, " transport: ", e.what());
       }
     }
   }

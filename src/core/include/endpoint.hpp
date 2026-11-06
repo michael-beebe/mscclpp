@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "ib.hpp"
+#include "mrc.hpp"
 #include "socket.h"
 
 #define MAX_IF_NAME_SIZE 16
@@ -24,10 +25,18 @@ struct Endpoint::Impl {
   uint64_t pidHash_;
 
   // The following are only used for IB and are undefined for other transports.
+#if defined(MSCCLPP_USE_IB)
   bool ibLocal_;
   bool ibNoAtomic_;
   std::shared_ptr<IbQp> ibQp_;
   IbQpInfo ibQpInfo_;
+#endif
+
+#if defined(MSCCLPP_USE_MRC)
+  bool mrcLocal_;
+  std::shared_ptr<MrcQp> mrcQp_;
+  MrcQpInfo mrcQpInfo_;
+#endif
 
   // The following are only used for Ethernet and are undefined for other transports.
   std::unique_ptr<Socket> socket_;

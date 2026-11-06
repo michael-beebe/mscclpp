@@ -35,7 +35,7 @@ if(MSCCLPP_USE_MRC)
 endif()
 
 if(MSCCLPP_USE_IB)
-    target_compile_definitions(mscclpp_obj PUBLIC USE_IBVERBS)
+    target_compile_definitions(mscclpp_obj PUBLIC USE_IBVERBS MSCCLPP_USE_IB)
 endif()
 
 if((MSCCLPP_USE_IB OR MSCCLPP_USE_MRC) AND MLX5_FOUND)

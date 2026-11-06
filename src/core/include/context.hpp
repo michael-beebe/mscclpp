@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "ib.hpp"
+#include "mrc.hpp"
 
 namespace mscclpp {
 
@@ -42,13 +43,20 @@ class CudaIpcStream {
 };
 
 class TokenPool;
+class MrcCtx;
 struct Context::Impl {
+#if defined(MSCCLPP_USE_IB)
   std::unordered_map<Transport, std::unique_ptr<IbCtx>> ibContexts_;
+#endif
+#if defined(MSCCLPP_USE_MRC)
+  std::unordered_map<Transport, std::unique_ptr<MrcCtx>> mrcContexts_;
+#endif
   std::vector<std::shared_ptr<CudaIpcStream>> ipcStreams_;
   std::shared_ptr<TokenPool> tokenPool_;
   const size_t maxNumTokens_ = 1 << 15;  // 32K tokens
 
   IbCtx* getIbContext(Transport ibTransport);
+  MrcCtx* getMrcContext(Transport mrcTransport);
   std::shared_ptr<uint64_t> getToken();
 };
 

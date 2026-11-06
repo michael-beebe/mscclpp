@@ -12,8 +12,11 @@
 #include <algorithm>
 #include <cerrno>
 #include <limits>
+#include <mscclpp/core.hpp>
+#include <mscclpp/env.hpp>
 #include <mscclpp/errors.hpp>
 #include <mscclpp/gpu_utils.hpp>
+#include <sstream>
 
 #if defined(MSCCLPP_USE_CUDA)
 #include <filesystem>
@@ -28,6 +31,31 @@ namespace mscclpp {
 
 static_assert(MRC_API_CURRENT_VERSION == MRC_API_VER(1, 0, 0));
 static_assert(MRC_API_VER_USED == MRC_API_VER(1, 0, 0));
+
+std::string getMrcDeviceName(Transport transport) {
+  if (!AllMrcTransports.has(transport)) {
+    throw Error("Not a native MRC transport", ErrorCode::InvalidUsage);
+  }
+  int index = static_cast<int>(transport) - static_cast<int>(Transport::MRC0);
+  if (!env()->hcaDevices.empty()) {
+    std::istringstream names(env()->hcaDevices);
+    std::string name;
+    for (int i = 0; i <= index; ++i) {
+      if (!std::getline(names, name, ',')) {
+        throw Error("Not enough HCA devices in MSCCLPP_HCA_DEVICES for native MRC", ErrorCode::InvalidUsage);
+      }
+    }
+    if (!name.empty()) return name;
+  }
+  int count = 0;
+  std::unique_ptr<ibv_device*, decltype(&ibv_free_device_list)> devices(ibv_get_device_list(&count),
+                                                                        ibv_free_device_list);
+  if (!devices) throw MrcError("ibv_get_device_list failed for native MRC selection", errno);
+  if (index >= count) {
+    throw Error("Native MRC device index out of range: " + std::to_string(index), ErrorCode::InvalidUsage);
+  }
+  return ibv_get_device_name(devices.get()[index]);
+}
 
 #if defined(MSCCLPP_USE_CUDA)
 static void checkGpuDmaTopology(CUdevice device, const std::string& dmaDevicePath) {

@@ -7,6 +7,7 @@
 #include <mscclpp/errors.hpp>
 #include <thread>
 
+#include "connection.hpp"
 #include "mp_unit_tests.hpp"
 #include "mrc.hpp"
 
@@ -132,8 +133,82 @@ TEST(MrcPeerToPeerTest, ReceiveCapacityAndReplenishment) {
       qp->stageSendWriteWithImm(nullptr, remoteMr, 0, i, 0, 0, true, value);
       immediates.push_back(value);
     }
+
     qp->postSend();
     drain(8, 8, immediates);
     MPI_Barrier(MPI_COMM_WORLD);
   }
+}
+
+struct MrcMetadataAccess : mscclpp::BaseConnection {
+  using BaseConnection::getImpl;
+};
+
+TEST(MultiProcessTest, MrcEndpointAndMemoryExchange) {
+  const char* device = std::getenv("MSCCLPP_TEST_MRC_DEVICE");
+  if (device == nullptr || gEnv->worldSize != 2) {
+    SKIP_TEST() << "Requires two ranks and MSCCLPP_TEST_MRC_DEVICE naming an MRC-capable NIC.";
+  }
+  auto transport = mscclpp::Transport::Unknown;
+  for (auto candidate :
+       {mscclpp::Transport::MRC0, mscclpp::Transport::MRC1, mscclpp::Transport::MRC2, mscclpp::Transport::MRC3}) {
+    if (mscclpp::getMrcDeviceName(candidate) == device) {
+      transport = candidate;
+      break;
+    }
+  }
+  ASSERT_TRUE(transport != mscclpp::Transport::Unknown);
+  auto context = mscclpp::Context::create();
+  std::vector<unsigned char> buffer(4096, 0x5a);
+  std::fill_n(buffer.begin(), 64, static_cast<unsigned char>(gEnv->rank + 17));
+  auto memory = context->registerMemory(buffer.data(), buffer.size(), transport);
+  auto endpoint = context->createEndpoint(
+      {transport, mscclpp::DeviceType::CPU, -1, {}, {1, std::stoi(gEnv->args["ib_gid_index"]), 0, 8, 8, 8}});
+  auto exchange = [](const std::vector<char>& local) {
+    std::vector<char> peers(local.size() * 2);
+    MPI_Allgather(local.data(), local.size(), MPI_BYTE, peers.data(), local.size(), MPI_BYTE, MPI_COMM_WORLD);
+    auto begin = peers.begin() + (1 - gEnv->rank) * local.size();
+    return std::vector<char>(begin, begin + local.size());
+  };
+  auto peerEndpoint = mscclpp::Endpoint::deserialize(exchange(endpoint.serialize()));
+  auto peerMemory = mscclpp::RegisteredMemory::deserialize(exchange(memory.serialize()));
+  auto& local = MrcMetadataAccess::getImpl(memory).getTransportInfo(transport);
+  auto& remote = MrcMetadataAccess::getImpl(peerMemory).getTransportInfo(peerEndpoint.transport());
+  EXPECT_TRUE(local.mrcLocal);
+  EXPECT_FALSE(remote.mrcLocal);
+  EXPECT_TRUE(remote.mrcMr == nullptr);
+  EXPECT_EQ(MrcMetadataAccess::getImpl(*context).mrcContexts_.size(), size_t{1});
+  auto qp = MrcMetadataAccess::getImpl(endpoint).mrcQp_;
+  qp->rtr(MrcMetadataAccess::getImpl(peerEndpoint).mrcQpInfo_);
+  qp->rts();
+  qp->stageRecv(0);
+  qp->postRecv();
+  MPI_Barrier(MPI_COMM_WORLD);
+  qp->stageSendWriteWithImm(local.mrcMr, remote.mrcMrInfo, 64, 0, 0, 1024, true, 0x01020304 + gEnv->rank);
+  qp->postSend();
+  bool received = false;
+  bool sent = false;
+  auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(8);
+  while (!received || !sent) {
+    int count = qp->pollRecvCq();
+    ASSERT_GE(count, 0);
+    for (int i = 0; i < count; ++i) {
+      ASSERT_EQ(qp->getRecvWcStatus(i), 0);
+      EXPECT_EQ(qp->getRecvWcImmData(i), static_cast<unsigned int>(0x01020304 + 1 - gEnv->rank));
+      received = true;
+    }
+    count = qp->pollSendCq();
+    ASSERT_GE(count, 0);
+    for (int i = 0; i < count; ++i) {
+      ASSERT_EQ(qp->getSendWcStatus(i), 0);
+      sent = true;
+    }
+    ASSERT_TRUE(std::chrono::steady_clock::now() < deadline);
+    std::this_thread::yield();
+  }
+  MPI_Barrier(MPI_COMM_WORLD);
+  std::vector<unsigned char> expected(4096, 0x5a);
+  std::fill_n(expected.begin(), 64, static_cast<unsigned char>(gEnv->rank + 17));
+  std::fill_n(expected.begin() + 1024, 64, static_cast<unsigned char>(1 - gEnv->rank + 17));
+  EXPECT_TRUE(buffer == expected);
 }

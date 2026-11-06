@@ -121,6 +121,7 @@ class CudaIpcConnection : public BaseConnection {
   void flush(int64_t timeoutUsec) override;
 };
 
+#if defined(MSCCLPP_USE_IB)
 class IBConnection : public BaseConnection {
  private:
   Transport transport_;
@@ -180,6 +181,8 @@ class IBConnection : public BaseConnection {
   void requestFlush() override;
   bool progressFlush() override;
 };
+
+#endif  // defined(MSCCLPP_USE_IB)
 
 class EthernetConnection : public BaseConnection {
  private:
