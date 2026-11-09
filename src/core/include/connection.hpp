@@ -19,6 +19,7 @@
 #include "endpoint.hpp"
 #include "gdr.hpp"
 #include "ib.hpp"
+#include "logger.hpp"
 #include "registered_memory.hpp"
 #include "socket.h"
 
@@ -91,6 +92,30 @@ class BaseConnection {
   static const Endpoint::Impl& getImpl(const Endpoint& endpoint);
   static const RegisteredMemory::Impl& getImpl(const RegisteredMemory& memory);
   static Context::Impl& getImpl(Context& context);
+
+  static void validateTransport(RegisteredMemory mem, Transport transport, uint64_t offset = 0, uint64_t size = 0) {
+    if (!mem.transports().has(transport)) {
+      THROW(CONN, Error, ErrorCode::InvalidUsage, "RegisteredMemory does not support this transport");
+    }
+    if (offset + size > mem.size()) {
+      THROW(CONN, Error, ErrorCode::InvalidUsage, "RegisteredMemory out of bounds");
+    }
+  }
+
+  static void validateAccumulateBounds(RegisteredMemory mem, uint64_t offset) {
+    constexpr uint64_t wordSize = sizeof(uint64_t);
+    if (offset > mem.size() || wordSize > mem.size() - offset) {
+      THROW(CONN, Error, ErrorCode::InvalidUsage, "RegisteredMemory out of bounds for 64-bit accumulate");
+    }
+  }
+
+  static void validateAccumulateAlignment(uintptr_t base, uint64_t offset) {
+    constexpr uintptr_t alignment = alignof(uint64_t);
+    uintptr_t targetAlignment = (base % alignment + offset % alignment) % alignment;
+    if (targetAlignment != 0) {
+      THROW(CONN, Error, ErrorCode::InvalidUsage, "accumulate destination must be naturally 8-byte aligned");
+    }
+  }
 
   std::shared_ptr<Context> context_;
   Endpoint localEndpoint_;
