@@ -1,15 +1,15 @@
-# IB-only RDMA resource/factory foundation
+# IB-only RDMA provider foundation
 
-**Status:** Proposed. Only the existing-code relocation is prepared;
-the resource/factory migration below is not implemented. Native MRC is a separate PR.
+**Status:** The existing-code relocation is published; the ownership/factory
+migration passes the bounded checks below and awaits review. Native MRC is a separate PR.
 
 ## Decision and justification
 
-Keep `Connection` for I/O. Add an internal RDMA seam for **resource creation,
+Keep `Connection` for I/O. Add an internal RDMA provider for **resource creation,
 ownership, serialization, and connection construction**. Replace IB-specific
 framework ownership; do not add a second cache or I/O layer.
 
-Today, provider responsibilities are spread across generic framework code:
+Before this PR, provider responsibilities were spread across generic framework code:
 
 | Existing owner/caller | IB-specific responsibility |
 | --- | --- |
@@ -21,24 +21,24 @@ Adding another provider directly repeats these branches and lifetime rules.
 Extending `Connection` cannot cover independently created endpoints/MRs or
 metadata import without a local NIC.
 
-`Context` owns the device/PD; endpoints and memory own QPs/MRs without retaining
-it. Only connections retain `Context`. Local resources must explicitly keep
-their provider alive: a lifetime invariant to establish, not a reproduced
+Previously, `Context` owned the device/PD; endpoints and memory owned QPs/MRs
+without retaining it. Only connections retained `Context`. Local resources now
+explicitly keep their provider alive: a lifetime invariant, not a reproduced
 teardown-failure claim.
 
-## Proposed structure
+## Ownership structure
 
 Each pair is one concrete object; existing NIC primitives remain unchanged.
 
 | Internal interface / IB implementation | Responsibility |
 | --- | --- |
-| `RdmaBackend` / `IbBackend` | Own `IbCtx`; provide endpoint and memory factories; remain cached per transport. |
+| `RdmaProvider` / `IbProvider` | Own `IbCtx`; provide endpoint and memory factories; remain cached per transport. |
 | `RdmaEndpoint` / `IbEndpoint` | Own a local QP or imported metadata; serialize it; construct the existing connection. |
 | `RdmaMemory` / `IbMemory` | Own a local MR or imported metadata; serialize it. |
 
 ```{mermaid}
 flowchart LR
-    C[Context] --> B["IbBackend : RdmaBackend"]
+    C[Context] --> B["IbProvider : RdmaProvider"]
     E[Endpoint] --> Q["IbEndpoint : RdmaEndpoint"]
     R[RegisteredMemory] --> M["IbMemory : RdmaMemory"]
     Q -->|retain when local| B
@@ -49,9 +49,14 @@ flowchart LR
     Q -. factory .-> Conn[IBConnection]
 ```
 
-Solid arrows denote ownership. Destroy QPs/MRs before releasing the backend.
-Imported wrappers own metadata only; backends never own wrappers (no cycle).
+Solid arrows denote ownership. Destroy QPs/MRs before releasing the provider.
+Imported wrappers own metadata only; providers never own wrappers (no cycle).
 User backing buffers remain non-owned.
+
+Registered memory pairs each resource owner with the existing borrowed
+`TransportInfo` view. IB operations still copy only that view. Per-record ownership
+preserves imported duplicate transports and their order; IB type checks remain
+in registration/import, not each write. Generic code retains the typed IB view.
 
 **The data path stays unchanged:**
 
@@ -79,11 +84,11 @@ Interfaces live in `src/core/include/`; concrete IB code stays in `ib.hpp`/`ib.c
 | Replace context, endpoint and MR ownership with the three pairs. | Substantive new code, justified only if it removes direct provider ownership from generic code and supports the next provider. |
 | Add focused tests. | Verify lifetime ordering, metadata and IB behavior without test-only production APIs. |
 
-The prepared relocation changes three files: **381 insertions, 372 removals,
+The first relocation commit changes three C++ files: **381 insertions, 372 removals,
 net nine lines**. IB method bodies and validation logic are unchanged. Those
-numbers describe only relocation, not the still-proposed ownership migration.
-New wrappers cost setup allocations/shared ownership; unchanged performance is
-not established.
+numbers describe only relocation, not the ownership migration.
+New wrappers add setup allocations/shared ownership and larger transport records;
+unchanged performance is not established.
 
 ## Alternatives
 
@@ -98,15 +103,17 @@ not established.
 Preserve public headers/APIs, transport selection, IB mode/GID/device resolution,
 queue limits, atomics fallback, signaling, async flush/error behavior, and CUDA
 IPC/Ethernet behavior. Preserve serialized bytes, record ordering and imported
-padding, including IB metadata deserialization in IB-disabled builds. Keep
-`USE_IBVERBS` guards and the existing legacy `MSCCLPP_USE_MRC` shim option;
-introduce no native flags, new environment variables, or algorithm changes.
+padding, including IB metadata deserialization in IB-disabled builds. New provider
+dispatch uses `MSCCLPP_USE_IB`, mirrored from the existing CMake option. Existing
+IB implementation guards remain unchanged; `MSCCLPP_USE_MRC` still selects the
+legacy shim in this PR. Introduce no native flags, new environment variables, or
+algorithm changes.
 
 Review relocation, then the independently compiling ownership/factory migration.
-Require standalone endpoint/MR lifetime tests (not merely dropping a context
-retained by a connection), exact metadata roundtrips, IB-enabled/disabled and
-legacy-shim builds, and matched-baseline real IB host and GPU/proxy/PortChannel cases.
 
-The relocation has passed those build configurations and bounded host/GPU IB
-comparisons. This does **not** qualify the proposed ownership migration, shim
-runtime, full collectives/performance, or native MRC.
+The migration passes standalone endpoint/MR lifetime tests (no connection retaining
+`Context`), exact imported metadata/order roundtrips with IB on/off, and
+IB-enabled/disabled and legacy-shim builds. XDR comparisons against the published
+relocation pass six host pairs (including mixed revisions), GPU/proxy/PortChannel,
+and CUDA IPC cases. This does **not** qualify shim runtime, full
+collectives/performance, or native MRC.

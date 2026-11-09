@@ -9,7 +9,6 @@
 #include <algorithm>
 #include <cstring>
 #include <mscclpp/gpu_utils.hpp>
-#include <unordered_map>
 
 #include "api.h"
 #include "context.hpp"
@@ -46,17 +45,18 @@ RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
     TransportInfo transportInfo;
     transportInfo.transport = Transport::CudaIpc;
     transportInfo.gpuIpcMemHandle = *localGpuIpcMemHandle;
-    this->transportInfos.emplace_back(transportInfo);
+    this->transportRecords.push_back({transportInfo, {}});
   }
   if ((transports & AllIBTransports).any()) {
     auto addIb = [&](Transport ibTransport) {
       TransportInfo transportInfo;
       transportInfo.transport = ibTransport;
-      this->ibMrMap[ibTransport] = contextImpl.getIbContext(ibTransport)->registerMr(data, size);
-      transportInfo.ibMr = this->ibMrMap[ibTransport].get();
-      transportInfo.ibLocal = true;
-      transportInfo.ibMrInfo = this->ibMrMap[ibTransport]->getInfo();
-      this->transportInfos.push_back(transportInfo);
+      auto memory = contextImpl.getRdmaProvider(ibTransport)->registerMemory(data, size);
+      const auto& ibMemory = getIbMemory(*memory);
+      transportInfo.ibMr = ibMemory.mr();
+      transportInfo.ibLocal = ibMemory.isLocal();
+      transportInfo.ibMrInfo = ibMemory.info();
+      this->transportRecords.push_back({transportInfo, std::move(memory)});
       INFO(NET, "IB mr for address ", data, " with size ", size, " is registered");
     };
     if (transports.has(Transport::IB0)) addIb(Transport::IB0);
@@ -89,12 +89,13 @@ MSCCLPP_API_CPP std::vector<char> RegisteredMemory::serialize() const {
   detail::serialize(result, pimpl_->hostHash);
   detail::serialize(result, pimpl_->pidHash);
   detail::serialize(result, pimpl_->transports);
-  if (pimpl_->transportInfos.size() > static_cast<size_t>(std::numeric_limits<int8_t>::max())) {
+  if (pimpl_->transportRecords.size() > static_cast<size_t>(std::numeric_limits<int8_t>::max())) {
     throw Error("Too many transport info entries", ErrorCode::InternalError);
   }
-  int8_t transportCount = pimpl_->transportInfos.size();
+  int8_t transportCount = pimpl_->transportRecords.size();
   detail::serialize(result, transportCount);
-  for (auto& entry : pimpl_->transportInfos) {
+  for (const auto& record : pimpl_->transportRecords) {
+    const auto& entry = record.info;
     detail::serialize(result, entry.transport);
     if (entry.transport == Transport::CudaIpc) {
       if (entry.gpuIpcMemHandle.typeFlags == GpuIpcMemHandle::Type::None) {
@@ -102,7 +103,7 @@ MSCCLPP_API_CPP std::vector<char> RegisteredMemory::serialize() const {
       }
       detail::serialize(result, entry.gpuIpcMemHandle);
     } else if (AllIBTransports.has(entry.transport)) {
-      detail::serialize(result, entry.ibMrInfo);
+      record.memory->serialize(result);
     } else {
       THROW(GPU, Error, ErrorCode::InternalError, "Unknown transport");
     }
@@ -126,16 +127,20 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
   it = detail::deserialize(it, transportCount);
   for (int i = 0; i < transportCount; ++i) {
     TransportInfo transportInfo;
+    std::shared_ptr<RdmaMemory> memory;
     it = detail::deserialize(it, transportInfo.transport);
     if (transportInfo.transport == Transport::CudaIpc) {
       it = detail::deserialize(it, transportInfo.gpuIpcMemHandle);
     } else if (AllIBTransports.has(transportInfo.transport)) {
-      it = detail::deserialize(it, transportInfo.ibMrInfo);
-      transportInfo.ibLocal = false;
+      memory = deserializeRdmaMemory(transportInfo.transport, it);
+      const auto& ibMemory = getIbMemory(*memory);
+      transportInfo.ibMr = ibMemory.mr();
+      transportInfo.ibLocal = ibMemory.isLocal();
+      transportInfo.ibMrInfo = ibMemory.info();
     } else {
       throw Error("Unknown transport", ErrorCode::InternalError);
     }
-    this->transportInfos.emplace_back(transportInfo);
+    this->transportRecords.push_back({transportInfo, std::move(memory)});
   }
   if (it != end) {
     throw Error("Serialization failed", ErrorCode::InternalError);
@@ -190,9 +195,9 @@ RegisteredMemory::Impl::Impl(const std::vector<char>& serialization)
     : Impl(serialization.begin(), serialization.end()) {}
 
 const TransportInfo& RegisteredMemory::Impl::getTransportInfo(Transport transport) const {
-  for (auto& entry : transportInfos) {
-    if (entry.transport == transport) {
-      return entry;
+  for (const auto& record : transportRecords) {
+    if (record.info.transport == transport) {
+      return record.info;
     }
   }
   throw Error("Transport data not found", ErrorCode::InternalError);

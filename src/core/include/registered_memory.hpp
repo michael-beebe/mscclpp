@@ -14,6 +14,8 @@
 
 namespace mscclpp {
 
+class RdmaMemory;
+
 struct TransportInfo {
   Transport transport;
 
@@ -29,6 +31,11 @@ struct TransportInfo {
 };
 
 struct RegisteredMemory::Impl {
+  struct TransportRecord {
+    TransportInfo info;
+    std::shared_ptr<RdmaMemory> memory;
+  };
+
   // This is the data pointer returned by RegisteredMemory::data(), which may be different from the original data
   // pointer for deserialized remote memory.
   void* data;
@@ -38,14 +45,13 @@ struct RegisteredMemory::Impl {
   uint64_t hostHash;
   uint64_t pidHash;
   TransportFlags transports;
-  std::vector<TransportInfo> transportInfos;
   std::shared_ptr<void> peerMemHandle;
 
   UniqueGpuIpcMemHandle localGpuIpcMemHandle;
   std::shared_ptr<void> remoteMemMap;
 
-  // Only used for IB transport
-  std::unordered_map<Transport, std::unique_ptr<const IbMr>> ibMrMap;
+  // Destroy transport resources before releasing IPC handles and mappings.
+  std::vector<TransportRecord> transportRecords;
 
   Impl(void* data, size_t size, TransportFlags transports, Context::Impl& contextImpl);
   Impl(const std::vector<char>::const_iterator& begin, const std::vector<char>::const_iterator& end);

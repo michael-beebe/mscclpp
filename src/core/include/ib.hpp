@@ -9,6 +9,8 @@
 #include <mscclpp/core.hpp>
 #include <string>
 
+#include "rdma_provider.hpp"
+
 // Forward declarations of IB structures
 struct ibv_context;
 struct ibv_pd;
@@ -175,6 +177,55 @@ class IbCtx {
   bool isDataDirect_;
   bool isVF_;
 };
+
+class IbMemory final : public RdmaMemory {
+ public:
+  IbMemory(std::shared_ptr<RdmaProvider> provider, std::unique_ptr<const IbMr> mr);
+  explicit IbMemory(const IbMrInfo& info);
+  bool isLocal() const override { return mr_ != nullptr; }
+  void serialize(std::vector<char>& data) const override;
+  const IbMr* mr() const { return mr_.get(); }
+  const IbMrInfo& info() const { return info_; }
+
+ private:
+  std::unique_ptr<const IbMr> mr_;
+  IbMrInfo info_;
+};
+
+class IbEndpoint final : public RdmaEndpoint {
+ public:
+  IbEndpoint(std::shared_ptr<RdmaProvider> provider, IbCtx& context, EndpointConfig& config);
+  IbEndpoint(const IbQpInfo& info, bool noAtomic);
+  bool isLocal() const override { return qp_ != nullptr; }
+  void serialize(std::vector<char>& data) const override;
+  std::shared_ptr<BaseConnection> createConnection(std::shared_ptr<Context> context, const Endpoint& local,
+                                                   const Endpoint& remote) const override;
+  const std::shared_ptr<IbQp>& qp() const { return qp_; }
+  const IbQpInfo& info() const { return info_; }
+  bool noAtomic() const { return noAtomic_; }
+  const IbCtx& context() const { return *context_; }
+
+ private:
+  IbCtx* context_ = nullptr;
+  std::shared_ptr<IbQp> qp_;
+  IbQpInfo info_;
+  bool noAtomic_;
+};
+
+class IbProvider final : public RdmaProvider {
+ public:
+  explicit IbProvider(Transport transport);
+  std::shared_ptr<RdmaEndpoint> createEndpoint(EndpointConfig& config) override;
+  std::shared_ptr<RdmaMemory> registerMemory(void* data, size_t size) override;
+
+ private:
+  IbCtx context_;
+};
+
+const IbEndpoint& getIbEndpoint(const RdmaEndpoint& endpoint);
+const IbMemory& getIbMemory(const RdmaMemory& memory);
+std::shared_ptr<RdmaEndpoint> deserializeIbEndpoint(std::vector<char>::const_iterator& it);
+std::shared_ptr<RdmaMemory> deserializeIbMemory(std::vector<char>::const_iterator& it);
 
 }  // namespace mscclpp
 

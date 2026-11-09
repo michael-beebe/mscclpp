@@ -33,4 +33,4 @@ You can find the followings from this documentation.
    :caption: Design notes
    :hidden:
 
-   design/rdma-backend
+   design/rdma-provider

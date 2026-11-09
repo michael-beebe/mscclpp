@@ -11,6 +11,7 @@
 #include <malloc.h>
 #include <unistd.h>
 
+#include <atomic>
 #include <cstring>
 #include <fstream>
 #include <mscclpp/core.hpp>
@@ -27,7 +28,7 @@
 #include "api.h"
 #include "atomic.hpp"
 #include "connection.hpp"
-#include "context.hpp"
+#include "gdr.hpp"
 #if defined(USE_IBVERBS)
 #include "ibverbs_wrapper.hpp"
 #if defined(MSCCLPP_USE_MLX5DV)
@@ -35,6 +36,7 @@
 #endif  // defined(MSCCLPP_USE_MLX5DV)
 #endif  // defined(USE_IBVERBS)
 #include "logger.hpp"
+#include "serialization.hpp"
 
 #if !defined(MSCCLPP_USE_ROCM)
 
@@ -766,6 +768,158 @@ unsigned int IbQp::getRecvWcImmData(int /*idx*/) const { return 0; }
 
 #endif  // !defined(USE_IBVERBS)
 
+class IBConnection : public BaseConnection {
+ private:
+  Transport transport_;
+  Transport remoteTransport_;
+  std::weak_ptr<IbQp> qp_;
+  std::unique_ptr<uint64_t> atomicSrc_;
+  RegisteredMemory atomicSrcMem_;
+  mscclpp::TransportInfo atomicSrcTransportInfo_;
+
+  // For write-with-imm mode (HostNoAtomic): uses RDMA write-with-imm to signal
+  // instead of atomic operations, with a host thread forwarding to GPU for memory consistency.
+  bool ibNoAtomic_;
+  bool gdrSignalForwarding_;  // ibNoAtomic_ && gdrEnabled() — decided once at construction
+  std::thread recvThread_;
+  std::atomic<bool> stopRecvThread_;
+  std::atomic<bool> recvThreadError_;  // Set by recv thread on fatal error
+  std::string recvThreadErrorMsg_;     // Error message from recv thread (written before recvThreadError_ is set)
+  int localGpuDeviceId_;               // Local GPU device ID for CUDA context and GDR mapping
+
+  // Signal forwarding design (HostNoAtomic mode):
+  // - Sender: 0-byte RDMA WRITE_WITH_IMM carrying the lower 32 bits of the token in imm_data.
+  // - Receiver: CPU recv thread polls recv CQ for WRITE_WITH_IMM completions (CQE), reads
+  //   the lower 32 bits from imm_data, reconstructs the full 64-bit token using wrap-around
+  //   detection (monotonically increasing tokens: if lower 32 bits decrease, the upper half
+  //   incremented), then writes it to signalAddr_ via atomicStore through GDRCopy BAR1.
+  uint64_t signalAddr_;
+
+  std::unique_ptr<GdrMap> signalGdrMap_;
+
+  void recvThreadFunc();
+
+ public:
+  IBConnection(std::shared_ptr<Context> context, const Endpoint& localEndpoint, const Endpoint& remoteEndpoint);
+  ~IBConnection();
+
+  /// Start signal forwarding to the given memory address.
+  /// Must be called before the remote sends any updateAndSync in HostNoAtomic mode.
+  /// @param mem Shared pointer to the GPU memory for the signal token.
+  void startSignalForwarding(std::shared_ptr<uint64_t> mem) override;
+
+  /// Stop signal forwarding and release associated resources.
+  void stopSignalForwarding() override;
+
+  bool isSignalForwarding() const override;
+
+  Transport transport() const override;
+
+  Transport remoteTransport() const override;
+
+  void write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMemory src, uint64_t srcOffset,
+             uint64_t size) override;
+  void updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) override;
+  void accumulate(RegisteredMemory dst, uint64_t dstOffset, int64_t value) override;
+
+  void flush(int64_t timeoutUsec) override;
+
+  void requestFlush() override;
+  bool progressFlush() override;
+};
+
+IbMemory::IbMemory(std::shared_ptr<RdmaProvider> provider, std::unique_ptr<const IbMr> mr)
+    : RdmaMemory(std::move(provider)), mr_(std::move(mr)), info_(mr_->getInfo()) {}
+
+IbMemory::IbMemory(const IbMrInfo& info) { std::memcpy(&info_, &info, sizeof(info_)); }
+
+void IbMemory::serialize(std::vector<char>& data) const { detail::serialize(data, info_); }
+
+IbEndpoint::IbEndpoint(std::shared_ptr<RdmaProvider> provider, IbCtx& context, EndpointConfig& config)
+    : RdmaEndpoint(std::move(provider)), context_(&context), noAtomic_(false) {
+  if (config.maxWriteQueueSize <= 0) {
+    config.maxWriteQueueSize = config.ib.maxCqSize;
+  }
+
+  if (config.ib.mode == EndpointConfig::Ib::Mode::HostNoAtomic) {
+    noAtomic_ = true;
+  } else if (config.ib.mode == EndpointConfig::Ib::Mode::Default) {
+    noAtomic_ = (env()->ibvMode == "host-no-atomic");
+  }
+
+  if (!noAtomic_ && !context.supportsRdmaAtomics()) {
+    WARN(NET, "IB device ", context.getDevName(),
+         " does not support RDMA atomics. Falling back to write-with-immediate mode (HostNoAtomic).");
+    noAtomic_ = true;
+  }
+
+  if (config.ib.gidIndex < 0) {
+    config.ib.gidIndex = env()->ibGidIndex;
+  }
+
+  int maxRecvWr = noAtomic_ ? config.ib.maxRecvWr : 0;
+  qp_ = context.createQp(config.ib.port, config.ib.gidIndex, config.ib.maxCqSize, config.ib.maxCqPollNum,
+                         config.ib.maxSendWr, maxRecvWr, config.ib.maxWrPerSend, noAtomic_);
+  std::memcpy(&info_, &qp_->getInfo(), sizeof(info_));
+}
+
+IbEndpoint::IbEndpoint(const IbQpInfo& info, bool noAtomic) : noAtomic_(noAtomic) {
+  std::memcpy(&info_, &info, sizeof(info_));
+}
+
+void IbEndpoint::serialize(std::vector<char>& data) const {
+  detail::serialize(data, info_);
+  detail::serialize(data, noAtomic_);
+}
+
+std::shared_ptr<BaseConnection> IbEndpoint::createConnection(std::shared_ptr<Context> context, const Endpoint& local,
+                                                             const Endpoint& remote) const {
+  if (!isLocal()) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "Cannot create a connection from a remote IB endpoint");
+  }
+  return std::make_shared<IBConnection>(std::move(context), local, remote);
+}
+
+IbProvider::IbProvider(Transport transport) : context_(getIBDeviceName(transport)) {}
+
+std::shared_ptr<RdmaEndpoint> IbProvider::createEndpoint(EndpointConfig& config) {
+  return std::make_shared<IbEndpoint>(shared_from_this(), context_, config);
+}
+
+std::shared_ptr<RdmaMemory> IbProvider::registerMemory(void* data, size_t size) {
+  return std::make_shared<IbMemory>(shared_from_this(), context_.registerMr(data, size));
+}
+
+const IbEndpoint& getIbEndpoint(const RdmaEndpoint& endpoint) {
+  const auto* ibEndpoint = dynamic_cast<const IbEndpoint*>(&endpoint);
+  if (!ibEndpoint) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "Expected an IB endpoint");
+  }
+  return *ibEndpoint;
+}
+
+const IbMemory& getIbMemory(const RdmaMemory& memory) {
+  const auto* ibMemory = dynamic_cast<const IbMemory*>(&memory);
+  if (!ibMemory) {
+    THROW(NET, Error, ErrorCode::InvalidUsage, "Expected IB memory");
+  }
+  return *ibMemory;
+}
+
+std::shared_ptr<RdmaEndpoint> deserializeIbEndpoint(std::vector<char>::const_iterator& it) {
+  IbQpInfo info;
+  bool noAtomic;
+  it = detail::deserialize(it, info);
+  it = detail::deserialize(it, noAtomic);
+  return std::make_shared<IbEndpoint>(info, noAtomic);
+}
+
+std::shared_ptr<RdmaMemory> deserializeIbMemory(std::vector<char>::const_iterator& it) {
+  IbMrInfo info;
+  it = detail::deserialize(it, info);
+  return std::make_shared<IbMemory>(info);
+}
+
 // IBConnection
 
 void IBConnection::recvThreadFunc() {
@@ -847,14 +1001,17 @@ IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& loc
       transport_(localEndpoint.transport()),
       remoteTransport_(remoteEndpoint.transport()),
       atomicSrc_(std::make_unique<uint64_t>(0)),
-      ibNoAtomic_(getImpl(localEndpoint).ibNoAtomic_),
+      ibNoAtomic_(false),
       gdrSignalForwarding_(false),
       stopRecvThread_(false),
       recvThreadError_(false),
       localGpuDeviceId_(localEndpoint.device().id),
       signalAddr_(0) {
-  qp_ = getImpl(localEndpoint).ibQp_;
-  qp_.lock()->rtr(getImpl(remoteEndpoint).ibQpInfo_);
+  const auto& localIbEndpoint = getIbEndpoint(*getImpl(localEndpoint).rdmaEndpoint_);
+  const auto& remoteIbEndpoint = getIbEndpoint(*getImpl(remoteEndpoint).rdmaEndpoint_);
+  ibNoAtomic_ = localIbEndpoint.noAtomic();
+  qp_ = localIbEndpoint.qp();
+  qp_.lock()->rtr(remoteIbEndpoint.info());
   qp_.lock()->rts();
   atomicSrcMem_ = context->registerMemory(atomicSrc_.get(), sizeof(uint64_t), transport_);
   validateTransport(atomicSrcMem_, transport_);
@@ -880,13 +1037,13 @@ IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& loc
     // when the device is not a VF. If data corruption occurs, switching to VF devices with
     // Data Direct or using IbMode::Host with RDMA atomics will resolve it.
     {
-      IbCtx* ibCtx = getImpl(*context).getIbContext(transport_);
-      if (!ibCtx->isVirtualFunction()) {
+      const auto& ibCtx = localIbEndpoint.context();
+      if (!ibCtx.isVirtualFunction()) {
         WARN(CONN,
              "IB HostNoAtomic mode without a Virtual Function (VF) device may cause data corruption "
              "on platforms with a CPU-GPU bridge that reorders posted writes (e.g., Grace/GB200). "
              "Device ",
-             ibCtx->getDevName(),
+             ibCtx.getDevName(),
              " is not a VF. "
              "If you experience data corruption, use VF devices with Data Direct or IbMode::Host.");
       }

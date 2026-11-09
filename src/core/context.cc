@@ -50,15 +50,14 @@ void CudaIpcStream::sync() {
   }
 }
 
-IbCtx* Context::Impl::getIbContext(Transport ibTransport) {
-  // Find IB context or create it
-  auto it = ibContexts_.find(ibTransport);
-  if (it == ibContexts_.end()) {
-    auto ibDev = getIBDeviceName(ibTransport);
-    ibContexts_[ibTransport] = std::make_unique<IbCtx>(ibDev);
-    return ibContexts_[ibTransport].get();
+std::shared_ptr<RdmaProvider> Context::Impl::getRdmaProvider(Transport transport) {
+  auto it = rdmaProviders_.find(transport);
+  if (it == rdmaProviders_.end()) {
+    auto provider = createRdmaProvider(transport);
+    rdmaProviders_.emplace(transport, provider);
+    return provider;
   }
-  return it->second.get();
+  return it->second;
 }
 
 std::shared_ptr<uint64_t> Context::Impl::getToken() {
@@ -98,7 +97,7 @@ MSCCLPP_API_CPP Connection Context::connect(const Endpoint& localEndpoint, const
   if (localTransport == Transport::CudaIpc) {
     conn = std::make_shared<CudaIpcConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
   } else if (AllIBTransports.has(localTransport)) {
-    conn = std::make_shared<IBConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
+    conn = localEndpoint.pimpl_->rdmaEndpoint_->createConnection(shared_from_this(), localEndpoint, remoteEndpoint);
   } else if (localTransport == Transport::Ethernet) {
     conn = std::make_shared<EthernetConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
   } else {
