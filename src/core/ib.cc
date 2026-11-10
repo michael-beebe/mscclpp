@@ -775,7 +775,7 @@ class IBConnection : public BaseConnection {
   std::weak_ptr<IbQp> qp_;
   std::unique_ptr<uint64_t> atomicSrc_;
   RegisteredMemory atomicSrcMem_;
-  mscclpp::TransportInfo atomicSrcTransportInfo_;
+  const IbMr* atomicSrcMr_ = nullptr;
 
   // For write-with-imm mode (HostNoAtomic): uses RDMA write-with-imm to signal
   // instead of atomic operations, with a host thread forwarding to GPU for memory consistency.
@@ -898,12 +898,12 @@ const IbEndpoint& getIbEndpoint(const RdmaEndpoint& endpoint) {
   return *ibEndpoint;
 }
 
-const IbMemory& getIbMemory(const RdmaMemory& memory) {
-  const auto* ibMemory = dynamic_cast<const IbMemory*>(&memory);
-  if (!ibMemory) {
+const IbMemory& getIbMemory(const TransportInfo& info) {
+  if (!AllIBTransports.has(info.transport) || !info.rdmaMemory) {
     THROW(NET, Error, ErrorCode::InvalidUsage, "Expected IB memory");
   }
-  return *ibMemory;
+  // Registration/import bind IB transport records to IbMemory.
+  return static_cast<const IbMemory&>(*info.rdmaMemory);
 }
 
 std::shared_ptr<RdmaEndpoint> deserializeIbEndpoint(std::vector<char>::const_iterator& it) {
@@ -1015,7 +1015,7 @@ IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& loc
   qp_.lock()->rts();
   atomicSrcMem_ = context->registerMemory(atomicSrc_.get(), sizeof(uint64_t), transport_);
   validateTransport(atomicSrcMem_, transport_);
-  atomicSrcTransportInfo_ = getImpl(atomicSrcMem_).getTransportInfo(transport_);
+  atomicSrcMr_ = getIbMemory(getImpl(atomicSrcMem_).getTransportInfo(transport_)).mr();
 
   if (ibNoAtomic_) {
 #if defined(MSCCLPP_USE_CUDA)
@@ -1113,17 +1113,17 @@ void IBConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMem
   validateTransport(dst, remoteTransport(), dstOffset, size);
   validateTransport(src, transport(), srcOffset, size);
 
-  auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
-  if (dstTransportInfo.ibLocal) {
+  const auto& dstMemory = getIbMemory(getImpl(dst).getTransportInfo(remoteTransport()));
+  if (dstMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
-  auto srcTransportInfo = getImpl(src).getTransportInfo(transport());
-  if (!srcTransportInfo.ibLocal) {
+  const auto& srcMemory = getIbMemory(getImpl(src).getTransportInfo(transport()));
+  if (!srcMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "src is remote, which is not supported");
   }
 
-  auto dstMrInfo = dstTransportInfo.ibMrInfo;
-  auto srcMr = srcTransportInfo.ibMr;
+  auto dstMrInfo = dstMemory.info();
+  auto srcMr = srcMemory.mr();
 
   qp_.lock()->stageSendWrite(srcMr, dstMrInfo, (uint32_t)size, /*wrId=*/0, /*srcOffset=*/srcOffset,
                              /*dstOffset=*/dstOffset, /*signaled=*/true);
@@ -1143,12 +1143,12 @@ void IBConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint6
 #endif
 
   validateTransport(dst, remoteTransport());
-  auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
-  if (dstTransportInfo.ibLocal) {
+  const auto& dstMemory = getIbMemory(getImpl(dst).getTransportInfo(remoteTransport()));
+  if (dstMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
 
-  auto dstMrInfo = dstTransportInfo.ibMrInfo;
+  auto dstMrInfo = dstMemory.info();
   // assert that src is on host
   uint64_t oldValue = *src;
   *src = newValue;
@@ -1173,7 +1173,7 @@ void IBConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint6
     qp_.lock()->postSend();
     INFO(CONN, "IBConnection signal forwarding: value ", oldValue, " -> ", newValue);
   } else {
-    qp_.lock()->stageSendAtomicAdd(atomicSrcTransportInfo_.ibMr, dstMrInfo, /*wrId=*/0, dstOffset, newValue - oldValue,
+    qp_.lock()->stageSendAtomicAdd(atomicSrcMr_, dstMrInfo, /*wrId=*/0, dstOffset, newValue - oldValue,
                                    /*signaled=*/true);
     qp_.lock()->postSend();
     INFO(CONN, "IBConnection atomic write: from ", src, " to ", (uint8_t*)dstMrInfo.addr + dstOffset, ", ", oldValue,
@@ -1224,19 +1224,19 @@ void IBConnection::flush(int64_t timeoutUsec) {
 void IBConnection::accumulate(RegisteredMemory dst, uint64_t dstOffset, int64_t value) {
   validateTransport(dst, remoteTransport());
   validateAccumulateBounds(dst, dstOffset);
-  auto dstTransportInfo = getImpl(dst).getTransportInfo(remoteTransport());
-  if (dstTransportInfo.ibLocal) {
+  const auto& dstMemory = getIbMemory(getImpl(dst).getTransportInfo(remoteTransport()));
+  if (dstMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
-  auto dstMrInfo = dstTransportInfo.ibMrInfo;
+  auto dstMrInfo = dstMemory.info();
   validateAccumulateAlignment(static_cast<uintptr_t>(dstMrInfo.addr), dstOffset);
 
   if (ibNoAtomic_) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "accumulate is not supported in IB no-atomic mode");
   }
 
-  qp_.lock()->stageSendAtomicAdd(atomicSrcTransportInfo_.ibMr, dstMrInfo, /*wrId=*/0, dstOffset,
-                                 static_cast<uint64_t>(value), /*signaled=*/true);
+  qp_.lock()->stageSendAtomicAdd(atomicSrcMr_, dstMrInfo, /*wrId=*/0, dstOffset, static_cast<uint64_t>(value),
+                                 /*signaled=*/true);
   qp_.lock()->postSend();
   INFO(CONN, "IBConnection accumulate: dst ", (uint8_t*)dstMrInfo.addr + dstOffset, ", value ", value);
 }

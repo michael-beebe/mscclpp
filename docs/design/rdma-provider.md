@@ -1,7 +1,6 @@
 # IB-only RDMA provider foundation
 
-**Status:** The existing-code relocation is published; the ownership/factory
-migration passes the bounded checks below and awaits review. Native MRC is a separate PR.
+**Status:** IB-only provider foundation under review. Native MRC is a separate PR.
 
 ## Decision and justification
 
@@ -53,10 +52,16 @@ Solid arrows denote ownership. Destroy QPs/MRs before releasing the provider.
 Imported wrappers own metadata only; providers never own wrappers (no cycle).
 User backing buffers remain non-owned.
 
-Registered memory pairs each resource owner with the existing borrowed
-`TransportInfo` view. IB operations still copy only that view. Per-record ownership
-preserves imported duplicate transports and their order; IB type checks remain
-in registration/import, not each write. Generic code retains the typed IB view.
+Registered-memory records contain a transport tag, IPC metadata and an owning
+`RdmaMemory` pointer, with no IB fields or header dependency. Factories bind each
+RDMA transport to its concrete memory type; IB code checks the tag before a
+`static_cast` to `IbMemory`. This adds a pointer dereference, not per-write RTTI
+or a connection/MR cache. Per-record ownership preserves imported duplicate
+transports and their order.
+
+RDMA classification and compatibility live with provider dispatch. Different IB
+device indices remain compatible; future provider families must define their own
+compatibility rather than treating all RDMA transports as interchangeable.
 
 **The data path stays unchanged:**
 
@@ -69,8 +74,9 @@ flowchart LR
     I --> Q[IbQp]
 ```
 
-Factories and new provider type checks run during setup. Preserve typed MR views
-and existing IB posting, signaling/forwarding, CQ polling and flush behavior.
+Factories and endpoint type checks run during setup. IB operations access typed
+provider-owned MRs directly; preserve existing posting, signaling/forwarding,
+CQ polling and flush behavior.
 Do not add an unused `address()` API, a separate virtual endpoint `connect()`,
 or a new virtual write/flush layer. QP transitions remain in connection construction.
 Interfaces live in `src/core/include/`; concrete IB code stays in `ib.hpp`/`ib.cc`.
@@ -109,7 +115,8 @@ IB implementation guards remain unchanged; `MSCCLPP_USE_MRC` still selects the
 legacy shim in this PR. Introduce no native flags, new environment variables, or
 algorithm changes.
 
-Review relocation, then the independently compiling ownership/factory migration.
+Review relocation, the independently compiling ownership/factory migration, then
+the generic-memory and routing cleanup.
 
 The migration passes standalone endpoint/MR lifetime tests (no connection retaining
 `Context`), exact imported metadata/order roundtrips with IB on/off, and

@@ -24,6 +24,8 @@ struct ibv_sge;
 
 namespace mscclpp {
 
+struct TransportInfo;
+
 struct IbMrInfo {
   uint64_t addr;
   uint32_t rkey;
@@ -223,7 +225,7 @@ class IbProvider final : public RdmaProvider {
 };
 
 const IbEndpoint& getIbEndpoint(const RdmaEndpoint& endpoint);
-const IbMemory& getIbMemory(const RdmaMemory& memory);
+const IbMemory& getIbMemory(const TransportInfo& info);
 std::shared_ptr<RdmaEndpoint> deserializeIbEndpoint(std::vector<char>::const_iterator& it);
 std::shared_ptr<RdmaMemory> deserializeIbMemory(std::vector<char>::const_iterator& it);
 

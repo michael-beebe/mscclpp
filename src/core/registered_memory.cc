@@ -45,28 +45,17 @@ RegisteredMemory::Impl::Impl(void* data, size_t size, TransportFlags transports,
     TransportInfo transportInfo;
     transportInfo.transport = Transport::CudaIpc;
     transportInfo.gpuIpcMemHandle = *localGpuIpcMemHandle;
-    this->transportRecords.push_back({transportInfo, {}});
+    this->transportRecords.push_back(std::move(transportInfo));
   }
-  if ((transports & AllIBTransports).any()) {
-    auto addIb = [&](Transport ibTransport) {
-      TransportInfo transportInfo;
-      transportInfo.transport = ibTransport;
-      auto memory = contextImpl.getRdmaProvider(ibTransport)->registerMemory(data, size);
-      const auto& ibMemory = getIbMemory(*memory);
-      transportInfo.ibMr = ibMemory.mr();
-      transportInfo.ibLocal = ibMemory.isLocal();
-      transportInfo.ibMrInfo = ibMemory.info();
-      this->transportRecords.push_back({transportInfo, std::move(memory)});
-      INFO(NET, "IB mr for address ", data, " with size ", size, " is registered");
-    };
-    if (transports.has(Transport::IB0)) addIb(Transport::IB0);
-    if (transports.has(Transport::IB1)) addIb(Transport::IB1);
-    if (transports.has(Transport::IB2)) addIb(Transport::IB2);
-    if (transports.has(Transport::IB3)) addIb(Transport::IB3);
-    if (transports.has(Transport::IB4)) addIb(Transport::IB4);
-    if (transports.has(Transport::IB5)) addIb(Transport::IB5);
-    if (transports.has(Transport::IB6)) addIb(Transport::IB6);
-    if (transports.has(Transport::IB7)) addIb(Transport::IB7);
+  const auto rdmaTransports = transports & getRdmaTransports();
+  for (size_t i = 0; i < static_cast<size_t>(Transport::NumTransports); ++i) {
+    auto transport = static_cast<Transport>(i);
+    if (!rdmaTransports.has(transport)) continue;
+    TransportInfo transportInfo;
+    transportInfo.transport = transport;
+    transportInfo.rdmaMemory = contextImpl.getRdmaProvider(transport)->registerMemory(data, size);
+    this->transportRecords.push_back(std::move(transportInfo));
+    INFO(NET, "RDMA mr for address ", data, " with size ", size, " is registered for ", transport);
   }
 }
 
@@ -94,16 +83,15 @@ MSCCLPP_API_CPP std::vector<char> RegisteredMemory::serialize() const {
   }
   int8_t transportCount = pimpl_->transportRecords.size();
   detail::serialize(result, transportCount);
-  for (const auto& record : pimpl_->transportRecords) {
-    const auto& entry = record.info;
+  for (const auto& entry : pimpl_->transportRecords) {
     detail::serialize(result, entry.transport);
     if (entry.transport == Transport::CudaIpc) {
       if (entry.gpuIpcMemHandle.typeFlags == GpuIpcMemHandle::Type::None) {
         THROW(GPU, Error, ErrorCode::InternalError, "GpuIpcMemHandle type is None");
       }
       detail::serialize(result, entry.gpuIpcMemHandle);
-    } else if (AllIBTransports.has(entry.transport)) {
-      record.memory->serialize(result);
+    } else if (getRdmaTransports().has(entry.transport)) {
+      entry.rdmaMemory->serialize(result);
     } else {
       THROW(GPU, Error, ErrorCode::InternalError, "Unknown transport");
     }
@@ -127,20 +115,15 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
   it = detail::deserialize(it, transportCount);
   for (int i = 0; i < transportCount; ++i) {
     TransportInfo transportInfo;
-    std::shared_ptr<RdmaMemory> memory;
     it = detail::deserialize(it, transportInfo.transport);
     if (transportInfo.transport == Transport::CudaIpc) {
       it = detail::deserialize(it, transportInfo.gpuIpcMemHandle);
-    } else if (AllIBTransports.has(transportInfo.transport)) {
-      memory = deserializeRdmaMemory(transportInfo.transport, it);
-      const auto& ibMemory = getIbMemory(*memory);
-      transportInfo.ibMr = ibMemory.mr();
-      transportInfo.ibLocal = ibMemory.isLocal();
-      transportInfo.ibMrInfo = ibMemory.info();
+    } else if (getRdmaTransports().has(transportInfo.transport)) {
+      transportInfo.rdmaMemory = deserializeRdmaMemory(transportInfo.transport, it);
     } else {
       throw Error("Unknown transport", ErrorCode::InternalError);
     }
-    this->transportRecords.push_back({transportInfo, std::move(memory)});
+    this->transportRecords.push_back(std::move(transportInfo));
   }
   if (it != end) {
     throw Error("Serialization failed", ErrorCode::InternalError);
@@ -166,23 +149,22 @@ RegisteredMemory::Impl::Impl(const std::vector<char>::const_iterator& begin,
       }
     }
   } else if (transports.has(Transport::CudaIpc)) {
-    // When transports include both CudaIpc and IB (e.g., CudaIpc | IB0),
-    // try CudaIpc first and fall back to IB on failure.
+    // Try CudaIpc first and fall back to RDMA on failure.
     auto entry = getTransportInfo(Transport::CudaIpc);
-    bool hasIB = (transports & AllIBTransports).any();
+    bool hasRdma = (transports & getRdmaTransports()).any();
     try {
       auto gpuIpcMem = GpuIpcMem::create(entry.gpuIpcMemHandle);
       this->remoteMemMap = gpuIpcMem->map();
       this->data = this->remoteMemMap.get();
     } catch (const BaseError& e) {
-      if (!hasIB) {
+      if (!hasRdma) {
         throw;
       }
       bool isSameHost = (getHostHash() == this->hostHash);
       if (isSameHost) {
-        WARN(GPU, "CudaIpc import failed on same host, falling back to IB transport: ", e.what());
+        WARN(GPU, "CudaIpc import failed on same host, falling back to RDMA transport: ", e.what());
       } else {
-        INFO(GPU, "CudaIpc import failed on remote host, falling back to IB transport: ", e.what());
+        INFO(GPU, "CudaIpc import failed on remote host, falling back to RDMA transport: ", e.what());
       }
     }
   }
@@ -196,8 +178,8 @@ RegisteredMemory::Impl::Impl(const std::vector<char>& serialization)
 
 const TransportInfo& RegisteredMemory::Impl::getTransportInfo(Transport transport) const {
   for (const auto& record : transportRecords) {
-    if (record.info.transport == transport) {
-      return record.info;
+    if (record.transport == transport) {
+      return record;
     }
   }
   throw Error("Transport data not found", ErrorCode::InternalError);

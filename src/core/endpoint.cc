@@ -6,7 +6,6 @@
 #include "api.h"
 #include "context.hpp"
 #include "logger.hpp"
-#include "registered_memory.hpp"
 #include "serialization.hpp"
 #include "socket.h"
 #include "utils_internal.hpp"
@@ -18,7 +17,7 @@ Endpoint::Impl::Impl(const EndpointConfig& config, Context::Impl& contextImpl)
   if (config_.device.type == DeviceType::GPU && config_.device.id < 0) {
     MSCCLPP_CUDATHROW(cudaGetDevice(&(config_.device.id)));
   }
-  if (AllIBTransports.has(config_.transport)) {
+  if (getRdmaTransports().has(config_.transport)) {
     rdmaEndpoint_ = contextImpl.getRdmaProvider(config_.transport)->createEndpoint(config_);
   } else if (config_.transport == Transport::Ethernet) {
     // Configuring Ethernet Interfaces
@@ -38,7 +37,7 @@ Endpoint::Impl::Impl(const std::vector<char>& serialization) {
   it = detail::deserialize(it, config_);
   it = detail::deserialize(it, hostHash_);
   it = detail::deserialize(it, pidHash_);
-  if (AllIBTransports.has(config_.transport)) {
+  if (getRdmaTransports().has(config_.transport)) {
     rdmaEndpoint_ = deserializeRdmaEndpoint(config_, it);
   } else if (config_.transport == Transport::Ethernet) {
     it = detail::deserialize(it, socketAddress_);
@@ -67,7 +66,7 @@ MSCCLPP_API_CPP std::vector<char> Endpoint::serialize() const {
   detail::serialize(data, pimpl_->config_);
   detail::serialize(data, pimpl_->hostHash_);
   detail::serialize(data, pimpl_->pidHash_);
-  if (AllIBTransports.has(pimpl_->config_.transport)) {
+  if (getRdmaTransports().has(pimpl_->config_.transport)) {
     pimpl_->rdmaEndpoint_->serialize(data);
   } else if (pimpl_->config_.transport == Transport::Ethernet) {
     detail::serialize(data, pimpl_->socketAddress_);

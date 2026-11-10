@@ -88,22 +88,21 @@ MSCCLPP_API_CPP Connection Context::connect(const Endpoint& localEndpoint, const
   }
   auto localTransport = localEndpoint.transport();
   auto remoteTransport = remoteEndpoint.transport();
-  if (localTransport != remoteTransport &&
-      !(AllIBTransports.has(localTransport) && AllIBTransports.has(remoteTransport))) {
+  if (localTransport != remoteTransport && !areRdmaTransportsCompatible(localTransport, remoteTransport)) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "Transport mismatch between local (", localTransport, ") and remote (",
           remoteTransport, ") endpoints");
   }
   std::shared_ptr<BaseConnection> conn;
   if (localTransport == Transport::CudaIpc) {
     conn = std::make_shared<CudaIpcConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
-  } else if (AllIBTransports.has(localTransport)) {
+  } else if (getRdmaTransports().has(localTransport)) {
     conn = localEndpoint.pimpl_->rdmaEndpoint_->createConnection(shared_from_this(), localEndpoint, remoteEndpoint);
   } else if (localTransport == Transport::Ethernet) {
     conn = std::make_shared<EthernetConnection>(shared_from_this(), localEndpoint, remoteEndpoint);
   } else {
     THROW(CONN, Error, ErrorCode::InternalError, "Unsupported transport: ", localTransport,
           " (this usually means EndpointConfig.transport was left at Transport::Unknown — "
-          "set it explicitly to CudaIpc, an IB transport, or Ethernet)");
+          "set it explicitly to CudaIpc, an RDMA transport, or Ethernet)");
   }
   return Connection(conn);
 }

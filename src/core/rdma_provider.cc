@@ -8,6 +8,13 @@
 
 namespace mscclpp {
 
+// Classification includes metadata imports even when local IB support is disabled.
+TransportFlags getRdmaTransports() { return AllIBTransports; }
+
+bool areRdmaTransportsCompatible(Transport local, Transport remote) {
+  return AllIBTransports.has(local) && AllIBTransports.has(remote);
+}
+
 std::shared_ptr<RdmaProvider> createRdmaProvider(Transport transport) {
   if (AllIBTransports.has(transport)) {
 #if defined(MSCCLPP_USE_IB)

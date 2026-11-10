@@ -48,6 +48,9 @@ class RdmaProvider : public std::enable_shared_from_this<RdmaProvider> {
   virtual std::shared_ptr<RdmaMemory> registerMemory(void* data, size_t size) = 0;
 };
 
+TransportFlags getRdmaTransports();
+bool areRdmaTransportsCompatible(Transport local, Transport remote);
+
 std::shared_ptr<RdmaProvider> createRdmaProvider(Transport transport);
 std::shared_ptr<RdmaEndpoint> deserializeRdmaEndpoint(const EndpointConfig& config,
                                                       std::vector<char>::const_iterator& it);

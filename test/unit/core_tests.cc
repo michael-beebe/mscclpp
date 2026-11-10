@@ -8,6 +8,7 @@
 
 #include "../framework.hpp"
 #include "connection.hpp"
+#include "ib.hpp"
 #include "serialization.hpp"
 #include "utils_internal.hpp"
 
@@ -15,6 +16,36 @@ namespace {
 
 struct RdmaTestAccess : mscclpp::BaseConnection {
   using BaseConnection::getImpl;
+};
+
+class OpaqueRdmaMemory : public mscclpp::RdmaMemory {
+ public:
+  OpaqueRdmaMemory(std::shared_ptr<mscclpp::RdmaProvider> provider, char metadata)
+      : RdmaMemory(std::move(provider)), metadata_(metadata) {}
+  bool isLocal() const override { return true; }
+  void serialize(std::vector<char>& data) const override { data.push_back(metadata_); }
+
+ private:
+  char metadata_;
+};
+
+class OpaqueRdmaProvider : public mscclpp::RdmaProvider {
+ public:
+  OpaqueRdmaProvider(mscclpp::Transport transport, std::vector<mscclpp::Transport>& calls, void* data, size_t size)
+      : transport_(transport), calls_(calls), data_(data), size_(size) {}
+  std::shared_ptr<mscclpp::RdmaEndpoint> createEndpoint(mscclpp::EndpointConfig&) override { return {}; }
+  std::shared_ptr<mscclpp::RdmaMemory> registerMemory(void* data, size_t size) override {
+    EXPECT_EQ(data, data_);
+    EXPECT_EQ(size, size_);
+    calls_.push_back(transport_);
+    return std::make_shared<OpaqueRdmaMemory>(shared_from_this(), static_cast<char>(transport_));
+  }
+
+ private:
+  mscclpp::Transport transport_;
+  std::vector<mscclpp::Transport>& calls_;
+  void* data_;
+  size_t size_;
 };
 
 }  // namespace
@@ -123,9 +154,132 @@ TEST(RdmaProviderTest, ImportedMemoryPreservesRecordOrderAndBytes) {
   auto memory = RegisteredMemory::deserialize(bytes);
   EXPECT_TRUE(memory.serialize() == bytes);
   EXPECT_EQ(memory.data(), nullptr);
-  const auto& firstIb1 = RdmaTestAccess::getImpl(memory).getTransportInfo(Transport::IB1);
-  EXPECT_EQ(firstIb1.ibMrInfo.addr, uint64_t{0x1000});
-  EXPECT_FALSE(firstIb1.ibLocal);
+  const auto& firstIb1 = getIbMemory(RdmaTestAccess::getImpl(memory).getTransportInfo(Transport::IB1));
+  EXPECT_EQ(firstIb1.info().addr, uint64_t{0x1000});
+  EXPECT_FALSE(firstIb1.isLocal());
+}
+
+TEST(RdmaProviderTest, ImportedMemoryPreservesMixedIpcMetadataBytes) {
+  using namespace mscclpp;
+  uint64_t buffer = 0;
+  void* ptr = &buffer;
+  size_t size = sizeof(buffer);
+  uint64_t hostHash = getHostHash();
+  uint64_t pidHash = getPidHash();
+  TransportFlags transports = Transport::CudaIpc | Transport::IB1;
+  int8_t transportCount = 3;
+  GpuIpcMemHandle ipc;
+  std::memset(&ipc, 0xa7, sizeof(ipc));
+  ipc.typeFlags = GpuIpcMemHandle::Type::RuntimeIpc;
+  ipc.baseSize = size;
+  ipc.offsetFromBase = 0;
+  IbMrInfo mr;
+  std::memset(&mr, 0x5a, sizeof(mr));
+  mr.addr = 0x2000;
+  mr.rkey = 59;
+  std::vector<char> bytes;
+  detail::serialize(bytes, ptr);
+  detail::serialize(bytes, size);
+  detail::serialize(bytes, hostHash);
+  detail::serialize(bytes, pidHash);
+  detail::serialize(bytes, transports);
+  detail::serialize(bytes, transportCount);
+  detail::serialize(bytes, Transport::IB1);
+  detail::serialize(bytes, mr);
+  detail::serialize(bytes, Transport::CudaIpc);
+  detail::serialize(bytes, ipc);
+  detail::serialize(bytes, Transport::IB1);
+  detail::serialize(bytes, mr);
+
+  // Same-process runtime IPC metadata requires no GPU import or address query.
+  auto memory = RegisteredMemory::deserialize(bytes);
+  EXPECT_TRUE(memory.serialize() == bytes);
+  EXPECT_EQ(memory.data(), ptr);
+  const auto& ipcInfo = RdmaTestAccess::getImpl(memory).getTransportInfo(Transport::CudaIpc);
+  try {
+    getIbMemory(ipcInfo);
+    FAIL() << "Expected IB memory access to reject an IPC record";
+  } catch (const Error& error) {
+    EXPECT_TRUE(error.getErrorCode() == ErrorCode::InvalidUsage);
+  }
+}
+
+TEST(RdmaProviderTest, RegisteredMemoryKeepsProviderMetadataOpaque) {
+  using namespace mscclpp;
+  uint64_t buffer = 0;
+  void* ptr = &buffer;
+  size_t size = sizeof(buffer);
+  std::vector<Transport> calls;
+  std::vector<std::weak_ptr<RdmaProvider>> providers;
+  auto context = Context::create();
+  // These test doubles are opaque to generic code and are never used for IB I/O.
+  for (auto transport : {Transport::IB7, Transport::IB1, Transport::IB0}) {
+    auto provider = std::make_shared<OpaqueRdmaProvider>(transport, calls, ptr, size);
+    providers.push_back(provider);
+    RdmaTestAccess::getImpl(*context).rdmaProviders_.emplace(transport, std::move(provider));
+  }
+  TransportFlags transports =
+      Transport::IB7 | Transport::IB0 | Transport::IB1 | Transport::Ethernet | Transport::Unknown;
+  auto memory = context->registerMemory(ptr, size, transports);
+  EXPECT_TRUE(calls == (std::vector<Transport>{Transport::IB0, Transport::IB1, Transport::IB7}));
+  EXPECT_EQ(memory.data(), ptr);
+  EXPECT_EQ(memory.size(), size);
+  EXPECT_EQ(memory.transports(), transports);
+
+  uint64_t hostHash = getHostHash();
+  uint64_t pidHash = getPidHash();
+  int8_t transportCount = 3;
+  std::vector<char> bytes;
+  detail::serialize(bytes, ptr);
+  detail::serialize(bytes, size);
+  detail::serialize(bytes, hostHash);
+  detail::serialize(bytes, pidHash);
+  detail::serialize(bytes, transports);
+  detail::serialize(bytes, transportCount);
+  for (auto transport : calls) {
+    detail::serialize(bytes, transport);
+    detail::serialize(bytes, static_cast<char>(transport));
+  }
+  context.reset();
+  for (const auto& provider : providers) EXPECT_FALSE(provider.expired());
+  EXPECT_TRUE(memory.serialize() == bytes);
+  memory = RegisteredMemory();
+  for (const auto& provider : providers) EXPECT_TRUE(provider.expired());
+}
+
+TEST(RdmaProviderTest, EndpointRoutingPreservesIbDeviceCompatibility) {
+  using namespace mscclpp;
+  auto importEndpoint = [](Transport transport) {
+    EndpointConfig config(transport, DeviceType::CPU);
+    uint64_t hostHash = 61;
+    uint64_t pidHash = 67;
+    std::vector<char> bytes;
+    detail::serialize(bytes, config);
+    detail::serialize(bytes, hostHash);
+    detail::serialize(bytes, pidHash);
+    if (AllIBTransports.has(transport)) {
+      detail::serialize(bytes, IbQpInfo{});
+      detail::serialize(bytes, false);
+    }
+    return Endpoint::deserialize(bytes);
+  };
+  auto context = Context::create();
+  for (auto pair : {std::pair{Transport::IB0, Transport::IB7}, std::pair{Transport::IB7, Transport::IB0},
+                    std::pair{Transport::IB0, Transport::CudaIpc}, std::pair{Transport::CudaIpc, Transport::IB0}}) {
+    auto local = importEndpoint(pair.first);
+    auto remote = importEndpoint(pair.second);
+    try {
+      context->connect(local, remote);
+      FAIL() << "Expected endpoint routing to reject connection construction";
+    } catch (const Error& error) {
+      EXPECT_TRUE(error.getErrorCode() == ErrorCode::InvalidUsage);
+      // Imported local IB endpoints stop at the provider factory, before NIC/GPU access.
+      const char* expected = AllIBTransports.has(pair.first) && AllIBTransports.has(pair.second)
+                                 ? "Cannot create a connection from a remote IB endpoint"
+                                 : "Transport mismatch";
+      EXPECT_TRUE(std::string(error.what()).find(expected) != std::string::npos);
+    }
+  }
 }
 
 TEST(RdmaProviderTest, LocalResourcesRetainProvider) {
