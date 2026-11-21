@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 
 #include "ib.hpp"
 
@@ -32,11 +32,15 @@
 #include "gpunetio.hpp"
 #if defined(USE_IBVERBS)
 #include "ibverbs_wrapper.hpp"
+#if defined(MSCCLPP_USE_MRC)
+#include <mrc.h>
+#endif
 #if defined(MSCCLPP_USE_MLX5DV)
 #include "mlx5dv_wrapper.hpp"
 #endif  // defined(MSCCLPP_USE_MLX5DV)
 #endif  // defined(USE_IBVERBS)
 #include "logger.hpp"
+#include "mrc_hints.hpp"
 #include "serialization.hpp"
 
 #if !defined(MSCCLPP_USE_ROCM)
@@ -57,9 +61,141 @@ namespace mscclpp {
 
 #if defined(USE_IBVERBS)
 
+Ib::Context* Ib::createContext(ibv_context* context) { return context; }
+void Ib::destroyContext(Context*) {}
+Ib::Cq* Ib::createCq(Context* context, int size) { return Verbs::ibv_create_cq(context, size, nullptr, nullptr, 0); }
+void Ib::destroyCq(Cq* cq) { Verbs::ibv_destroy_cq(cq); }
+Ib::Hint* Ib::createHint(Context*) { return nullptr; }
+int Ib::destroyHint(Hint*) { return 0; }
+Ib::Qp* Ib::createQp(Context*, ibv_pd* pd, Cq* sendCq, Cq* recvCq, const ibv_qp_cap& cap) {
+  ibv_qp_init_attr attr = {};
+  attr.send_cq = sendCq;
+  attr.recv_cq = recvCq;
+  attr.qp_type = IBV_QPT_RC;
+  attr.cap = cap;
+  return Verbs::ibv_create_qp(pd, &attr);
+}
+int Ib::destroyQp(Qp* qp) { return Verbs::ibv_destroy_qp(qp); }
+int Ib::getQpn(Qp* qp, uint32_t* qpn) {
+  *qpn = qp->qp_num;
+  return 0;
+}
+int Ib::modifyQp(Qp* qp, ibv_qp_attr* attr, int mask, Hint*) { return Verbs::ibv_modify_qp(qp, attr, mask); }
+int Ib::postSend(Qp* qp, ibv_send_wr* wr, ibv_send_wr** badWr) { return Verbs::ibv_post_send(qp, wr, badWr); }
+int Ib::postRecv(Qp* qp, ibv_recv_wr* wr, ibv_recv_wr** badWr) { return Verbs::ibv_post_recv(qp, wr, badWr); }
+int Ib::pollCq(Cq* cq, int count, ibv_wc* wc) { return Verbs::ibv_poll_cq(cq, count, wc); }
+
+#if defined(MSCCLPP_USE_MRC)
+Mrc::Context* Mrc::createContext(ibv_context* context) {
+  mrc_attr attr = {};
+  int supported = 0;
+  int ret = ::mrc_query_device(context, &attr, &supported);
+  if (ret != 0) {
+    THROW(NET, IbError, ret < 0 ? errno : ret, "mrc_query_device failed");
+  }
+  if (!supported) {
+    THROW(NET, Error, ErrorCode::InvalidUsage, "Selected device does not support native MRC");
+  }
+  mrc_context_attr contextAttr = {};
+  contextAttr.mrc_api_version_used = MRC_API_VER_USED;
+  return ::mrc_create_context(context, &contextAttr);
+}
+void Mrc::destroyContext(Context* context) { (void)::mrc_destroy_context(context); }
+Mrc::Cq* Mrc::createCq(Context* context, int size) { return ::mrc_create_cq(context, size, nullptr, nullptr, 0); }
+void Mrc::destroyCq(Cq* cq) { (void)::mrc_destroy_cq(cq); }
+Mrc::Hint* Mrc::createHint(Context* context) {
+  const auto config = env();
+  if (!config->mrcQpHintEnable) return nullptr;
+  // MSCCL++ currently owns one QP per connection. Preserve the plugin's
+  // connection-wide MIN_RATE / QP-count semantics without inventing a mesh size.
+  constexpr int numQpsPerPeer = 1;
+  const auto cc =
+      detail::makeMrcCcHint(config->mrcCcInitRate, config->mrcCcMinRate, config->mrcCcMaxRate, numQpsPerPeer);
+  static_assert(sizeof(cc) <= MRC_MAX_VENDOR_CFG_SIZE);
+  mrc_qp_hint_init_attr attr{};
+  attr.attr.num_qps_per_peer = numQpsPerPeer;
+  attr.attr.num_send_peers = 1;
+  std::memcpy(attr.attr.vendor_cfg, &cc, sizeof(cc));
+  INFO(NET, "Native MRC QP hint num_qps_per_peer=1 num_send_peers=1 cc_version=", cc.version,
+       " cc_init_rate=", cc.initRate, " cc_min_rate=", cc.minRate, " cc_max_rate=", cc.maxRate);
+  auto* hint = ::mrc_create_qp_hint(context, &attr);
+  if (!hint) {
+    THROW(NET, IbError, errno, "mrc_create_qp_hint failed (errno ", errno, ")");
+  }
+  return hint;
+}
+int Mrc::destroyHint(Hint* hint) { return ::mrc_destroy_qp_hint(hint); }
+Mrc::Qp* Mrc::createQp(Context* context, ibv_pd* pd, Cq* sendCq, Cq* recvCq, const ibv_qp_cap& cap) {
+  mrc_qp_init_attr attr = {};
+  attr.send_cq = sendCq;
+  attr.recv_cq = recvCq;
+  attr.pd = pd;
+  attr.cap = cap;
+  return ::mrc_create_qp(context, &attr);
+}
+int Mrc::destroyQp(Qp* qp) { return ::mrc_destroy_qp(qp); }
+int Mrc::getQpn(Qp* qp, uint32_t* qpn) { return ::mrc_get_qpn(qp, qpn); }
+int Mrc::modifyQp(Qp* qp, ibv_qp_attr* attr, int mask, Hint* hint) {
+  mrc_qp_attr mrcAttr = {};
+  int mrcMask = 0;
+  if (hint && (mask & IBV_QP_STATE) && attr->qp_state == IBV_QPS_INIT) {
+    mrcAttr.qp_hint = hint;
+    mrcMask |= MRC_QP_HINT;
+  }
+  if (mask & IBV_QP_TIMEOUT) {
+    // MRC uses 1.024us rather than IB's 4.096us base. Preserve the nominal
+    // timeout (IB exponent 18 -> MRC exponent 20), not the packet retry policy.
+    if (attr->timeout > 22) {
+      THROW(NET, Error, ErrorCode::InvalidUsage, "Timeout exceeds the native MRC limit");
+    }
+    mrcAttr.timeout = attr->timeout + 2;
+    mrcMask |= MRC_QP_TIMEOUT;
+  }
+  // Keep PORT and retry/RNR fields, as in the native plugin. Despite the
+  // header's unsupported-mask list, DOCA 3.2 uses these fields: omitting PORT
+  // leaves port 0; omitting retry/RNR leaves zero retries (verified by query).
+  // Timeout uses the native mask; read/atomic and alternate-path masks do not.
+  mask &=
+      ~(IBV_QP_TIMEOUT | IBV_QP_MAX_QP_RD_ATOMIC | IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_ALT_PATH | IBV_QP_PATH_MIG_STATE);
+  return ::mrc_modify_qp(qp, attr, mask, &mrcAttr, mrcMask);
+}
+int Mrc::postSend(Qp* qp, ibv_send_wr* wr, ibv_send_wr** badWr) { return ::mrc_post_send(qp, wr, badWr); }
+int Mrc::postRecv(Qp* qp, ibv_recv_wr* wr, ibv_recv_wr** badWr) { return ::mrc_post_recv(qp, wr, badWr); }
+int Mrc::pollCq(Cq* cq, int count, ibv_wc* wc) { return ::mrc_poll_cq(cq, count, wc); }
+#else
+Mrc::Context* Mrc::createContext(ibv_context*) {
+  THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled");
+}
+void Mrc::destroyContext(Context*) {}
+Mrc::Cq* Mrc::createCq(Context*, int) {
+  THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled");
+}
+void Mrc::destroyCq(Cq*) {}
+Mrc::Hint* Mrc::createHint(Context*) {
+  THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled");
+}
+int Mrc::destroyHint(Hint*) { return 0; }
+Mrc::Qp* Mrc::createQp(Context*, ibv_pd*, Cq*, Cq*, const ibv_qp_cap&) {
+  THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled");
+}
+int Mrc::destroyQp(Qp*) { return 0; }
+int Mrc::getQpn(Qp*, uint32_t*) { THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled"); }
+int Mrc::modifyQp(Qp*, ibv_qp_attr*, int, Hint*) {
+  THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled");
+}
+int Mrc::postSend(Qp*, ibv_send_wr*, ibv_send_wr**) {
+  THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled");
+}
+int Mrc::postRecv(Qp*, ibv_recv_wr*, ibv_recv_wr**) {
+  THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled");
+}
+int Mrc::pollCq(Cq*, int, ibv_wc*) { THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC support is not enabled"); }
+#endif
+
+template <typename Verbs>
 static inline bool isDmabufSupportedByGpu(int gpuId) {
   static std::unordered_map<int, bool> cache;
-  if (gpuId < 0 || !IBVerbs::isDmabufSupported()) {
+  if (gpuId < 0 || !Verbs::isDmabufSupported()) {
     return false;
   }
   if (cache.find(gpuId) != cache.end()) {
@@ -79,7 +215,10 @@ static inline bool isDmabufSupportedByGpu(int gpuId) {
   return ret;
 }
 
-IbMr::IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect) : mr_(nullptr), buff_(buff), size_(0) {
+template <typename Verbs>
+static ibv_mr* registerVerbsMr(ibv_pd* pd, void* buff, std::size_t size, [[maybe_unused]] bool isDataDirect,
+                               std::size_t& registeredSize) {
+  ibv_mr* mr = nullptr;
   if (size == 0) {
     THROW(NET, Error, ErrorCode::InvalidUsage, "invalid MR size: 0");
   }
@@ -87,15 +226,19 @@ IbMr::IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect) : mr_(nu
   if (pageSize == 0) {
     pageSize = sysconf(_SC_PAGESIZE);
   }
-  uintptr_t buffIntPtr = reinterpret_cast<uintptr_t>(buff_);
+  uintptr_t buffIntPtr = reinterpret_cast<uintptr_t>(buff);
   uintptr_t addr = buffIntPtr & -pageSize;
   std::size_t pages = (size + (buffIntPtr - addr) + pageSize - 1) / pageSize;
 
-  int gpuId = detail::gpuIdFromAddress(buff_);
+  int gpuId = detail::gpuIdFromAddress(buff);
   bool isGpuBuff = (gpuId != -1);
-  if (isGpuBuff && isDmabufSupportedByGpu(gpuId)) {
+  if (isGpuBuff && isDmabufSupportedByGpu<Verbs>(gpuId)) {
 #if !defined(MSCCLPP_USE_ROCM)
     int fd = -1;
+    auto closeFd = [](int* fd) {
+      if (*fd >= 0) ::close(*fd);
+    };
+    std::unique_ptr<int, decltype(closeFd)> fdGuard(&fd, closeFd);
     size_t rangeSize = pages * pageSize;
 
     // Obtain a DMA-BUF file descriptor for the GPU memory range. On platforms with a CPU-GPU
@@ -123,24 +266,24 @@ IbMr::IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect) : mr_(nu
 
 #if defined(MSCCLPP_USE_MLX5DV)
     if (isDataDirect) {
-      mr_ = MLX5DV::mlx5dv_reg_dmabuf_mr(pd, offsetInDmaBuf, size, buffIntPtr, fd, accessFlags);
+      mr = MLX5DV::mlx5dv_reg_dmabuf_mr(pd, offsetInDmaBuf, size, buffIntPtr, fd, accessFlags);
     }
 #endif
-    if (mr_ == nullptr) {
-      mr_ = IBVerbs::ibv_reg_dmabuf_mr(pd, offsetInDmaBuf, size, buffIntPtr, fd, accessFlags);
+    if (mr == nullptr) {
+      mr = Verbs::ibv_reg_dmabuf_mr(pd, offsetInDmaBuf, size, buffIntPtr, fd, accessFlags);
     }
 
     // If MR registration failed with a PCIe-mapped fd, retry with the default mapping.
 #if (CUDA_VERSION >= 12080)
-    if (mr_ == nullptr && usedPcieFlag) {
+    if (mr == nullptr && usedPcieFlag) {
       ::close(fd);
+      fd = -1;
       MSCCLPP_CUTHROW(cuMemGetHandleForAddressRange(&fd, addr, rangeSize, CU_MEM_RANGE_HANDLE_TYPE_DMA_BUF_FD, 0));
-      mr_ = IBVerbs::ibv_reg_dmabuf_mr(pd, offsetInDmaBuf, size, buffIntPtr, fd, accessFlags);
+      mr = Verbs::ibv_reg_dmabuf_mr(pd, offsetInDmaBuf, size, buffIntPtr, fd, accessFlags);
     }
 #endif  // CUDA_VERSION >= 12080
 
-    ::close(fd);
-    if (mr_ == nullptr) {
+    if (mr == nullptr) {
       THROW(NET, IbError, errno, "ibv_reg_dmabuf_mr failed (errno ", errno, ")");
     }
 #else   // defined(MSCCLPP_USE_ROCM)
@@ -149,7 +292,7 @@ IbMr::IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect) : mr_(nu
   } else {
 #if !defined(MSCCLPP_USE_ROCM)
     if (isGpuBuff) {
-      if (isCuMemMapAllocated(buff_)) {
+      if (isCuMemMapAllocated(buff)) {
         THROW(NET, Error, ErrorCode::InvalidUsage, "DMABUF is required but is not supported in this platform.");
       }
       // Need nvidia-peermem when DMABUF is not supported
@@ -158,18 +301,30 @@ IbMr::IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect) : mr_(nu
       }
     }
 #endif  // !defined(MSCCLPP_USE_ROCM)
-    mr_ = IBVerbs::ibv_reg_mr(pd, reinterpret_cast<void*>(addr), pages * pageSize,
-                              IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
-                                  IBV_ACCESS_RELAXED_ORDERING | IBV_ACCESS_REMOTE_ATOMIC);
-    if (mr_ == nullptr) {
+    mr = Verbs::ibv_reg_mr(pd, reinterpret_cast<void*>(addr), pages * pageSize,
+                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ |
+                               IBV_ACCESS_RELAXED_ORDERING | IBV_ACCESS_REMOTE_ATOMIC);
+    if (mr == nullptr) {
       THROW(NET, IbError, errno, "ibv_reg_mr failed (errno ", errno, ")");
     }
   }
 
-  size_ = pages * pageSize;
+  registeredSize = pages * pageSize;
+  return mr;
 }
 
-IbMr::~IbMr() { IBVerbs::ibv_dereg_mr(mr_); }
+IbMr::IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect, bool native)
+    : mr_(nullptr), buff_(buff), size_(0), native_(native) {
+  mr_ = native_ ? registerVerbsMr<NativeIBVerbs>(pd, buff, size, isDataDirect, size_)
+                : registerVerbsMr<IBVerbs>(pd, buff, size, isDataDirect, size_);
+}
+
+IbMr::~IbMr() {
+  if (native_)
+    NativeIBVerbs::ibv_dereg_mr(mr_);
+  else
+    IBVerbs::ibv_dereg_mr(mr_);
+}
 
 IbMrInfo IbMr::getInfo() const {
   IbMrInfo info;
@@ -182,12 +337,15 @@ const void* IbMr::getBuff() const { return buff_; }
 
 uint32_t IbMr::getLkey() const { return mr_->lkey; }
 
-IbQp::IbQp(ibv_context* ctx, ibv_pd* pd, int portNum, int gidIndex, int maxSendCqSize, int maxSendCqPollNum,
-           int maxSendWr, int maxRecvWr, int maxWrPerSend, bool noAtomic)
+template <typename Backend>
+VerbsQp<Backend>::VerbsQp(typename Backend::Context* ctx, ibv_context* verbsCtx, ibv_pd* pd, int portNum, int gidIndex,
+                          int maxSendCqSize, int maxSendCqPollNum, int maxSendWr, int maxRecvWr, int maxWrPerSend,
+                          bool noAtomic)
     : portNum_(portNum),
       gidIndex_(gidIndex),
       info_(),
       qp_(nullptr),
+      hint_(nullptr),
       sendCq_(nullptr),
       recvCq_(nullptr),
       sendWcs_(),
@@ -206,90 +364,109 @@ IbQp::IbQp(ibv_context* ctx, ibv_pd* pd, int portNum, int gidIndex, int maxSendC
       maxWrPerSend_(maxWrPerSend),
       maxRecvWr_(maxRecvWr),
       noAtomic_(noAtomic) {
-  sendCq_ = IBVerbs::ibv_create_cq(ctx, maxSendCqSize, nullptr, nullptr, 0);
-  if (sendCq_ == nullptr) {
-    THROW(NET, IbError, errno, "ibv_create_cq failed (errno ", errno, ")");
+  if (maxSendCqSize <= 0 || maxSendCqPollNum <= 0 || maxSendWr <= 0 || maxWrPerSend <= 0 || maxRecvWr < 0 ||
+      (noAtomic && maxRecvWr == 0)) {
+    THROW(NET, Error, ErrorCode::InvalidUsage, "Invalid RDMA queue sizes");
   }
-
-  // Only create recv CQ if maxRecvWr > 0
-  if (maxRecvWr > 0) {
-    recvCq_ = IBVerbs::ibv_create_cq(ctx, maxRecvWr, nullptr, nullptr, 0);
-    if (recvCq_ == nullptr) {
-      THROW(NET, IbError, errno, "ibv_create_cq failed (errno ", errno, ")");
-    }
-  }
-
-  struct ibv_qp_init_attr qpInitAttr = {};
-  qpInitAttr.sq_sig_all = 0;
-  qpInitAttr.send_cq = sendCq_;
-  // Use separate recv CQ if created, otherwise use the send CQ
-  qpInitAttr.recv_cq = (recvCq_ != nullptr) ? recvCq_ : sendCq_;
-  qpInitAttr.qp_type = IBV_QPT_RC;
-  qpInitAttr.cap.max_send_wr = maxSendWr;
-  qpInitAttr.cap.max_recv_wr = maxRecvWr;
-  qpInitAttr.cap.max_send_sge = 1;
-  qpInitAttr.cap.max_recv_sge = 1;
-  qpInitAttr.cap.max_inline_data = 0;
-
-  struct ibv_qp* qp = IBVerbs::ibv_create_qp(pd, &qpInitAttr);
-  if (qp == nullptr) {
-    THROW(NET, IbError, errno, "ibv_create_qp failed (errno ", errno, ")");
-  }
-
-  struct ibv_port_attr portAttr;
-  if (IBVerbs::ibv_query_port(ctx, portNum_, &portAttr) != 0) {
-    THROW(NET, IbError, errno, "ibv_query_port failed (errno ", errno, ")");
-  }
-  info_.lid = portAttr.lid;
-  info_.linkLayer = portAttr.link_layer;
-  info_.qpn = qp->qp_num;
-  info_.mtu = portAttr.active_mtu;
-  info_.isGrh = (portAttr.flags & IBV_QPF_GRH_REQUIRED);
-
-  if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND || info_.isGrh) {
-    if (gidIndex_ >= portAttr.gid_tbl_len) {
-      THROW(NET, Error, ErrorCode::InvalidUsage, "invalid GID index ", gidIndex_, " for port ", portNum_,
-            " (max index is ", portAttr.gid_tbl_len - 1, ")");
+  try {
+    hint_ = Backend::createHint(ctx);
+    sendCq_ = Backend::createCq(ctx, maxSendCqSize);
+    if (sendCq_ == nullptr) {
+      THROW(NET, IbError, errno, Backend::name, " create CQ failed (errno ", errno, ")");
     }
 
-    union ibv_gid gid = {};
-    if (IBVerbs::ibv_query_gid(ctx, portNum_, gidIndex_, &gid) != 0) {
-      THROW(NET, IbError, errno, "ibv_query_gid failed for port ", portNum_, " index ", gidIndex_, " (errno ", errno,
-            ")");
+    // Only create recv CQ if maxRecvWr > 0
+    if (maxRecvWr > 0) {
+      recvCq_ = Backend::createCq(ctx, maxRecvWr);
+      if (recvCq_ == nullptr) {
+        THROW(NET, IbError, errno, Backend::name, " create CQ failed (errno ", errno, ")");
+      }
     }
-    info_.spn = gid.global.subnet_prefix;
-    info_.iid = gid.global.interface_id;
-  }
 
-  struct ibv_qp_attr qpAttr = {};
-  qpAttr.qp_state = IBV_QPS_INIT;
-  qpAttr.pkey_index = 0;
-  qpAttr.port_num = portNum_;
-  qpAttr.qp_access_flags = noAtomic_ ? IBV_ACCESS_REMOTE_WRITE
-                                     : (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
-  if (IBVerbs::ibv_modify_qp(qp, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS) != 0) {
-    THROW(NET, IbError, errno, "ibv_modify_qp failed (errno ", errno, ")");
-  }
-  qp_ = qp;
-  sendWrs_ = std::make_shared<std::vector<ibv_send_wr>>(maxWrPerSend_);
-  sendSges_ = std::make_shared<std::vector<ibv_sge>>(maxWrPerSend_);
-  sendWcs_ = std::make_shared<std::vector<ibv_wc>>(maxSendCqPollNum_);
-  recvWcs_ = std::make_shared<std::vector<ibv_wc>>(maxRecvWr_);
-  if (maxRecvWr_ > 0) {
-    recvWrs_ = std::make_shared<std::vector<ibv_recv_wr>>(maxRecvWr_);
-    recvSges_ = std::make_shared<std::vector<ibv_sge>>(maxRecvWr_);
+    ibv_qp_cap cap = {};
+    // Use separate recv CQ if created, otherwise use the send CQ
+    cap.max_send_wr = maxSendWr;
+    cap.max_recv_wr = maxRecvWr;
+    cap.max_send_sge = 1;
+    cap.max_recv_sge = 1;
+    cap.max_inline_data = 0;
+
+    qp_ = Backend::createQp(ctx, pd, sendCq_, recvCq_ ? recvCq_ : sendCq_, cap);
+    if (qp_ == nullptr) {
+      THROW(NET, IbError, errno, Backend::name, " create QP failed (errno ", errno, ")");
+    }
+
+    struct ibv_port_attr portAttr;
+    if (Verbs::ibv_query_port(verbsCtx, portNum_, &portAttr) != 0) {
+      THROW(NET, IbError, errno, "ibv_query_port failed (errno ", errno, ")");
+    }
+    info_.lid = portAttr.lid;
+    info_.linkLayer = portAttr.link_layer;
+    if (Backend::getQpn(qp_, &info_.qpn) != 0) {
+      THROW(NET, IbError, errno, Backend::name, " get QPN failed (errno ", errno, ")");
+    }
+    info_.mtu = portAttr.active_mtu;
+    info_.isGrh = (portAttr.flags & IBV_QPF_GRH_REQUIRED);
+
+    if (portAttr.link_layer != IBV_LINK_LAYER_INFINIBAND || info_.isGrh) {
+      if (gidIndex_ < 0 || gidIndex_ >= portAttr.gid_tbl_len) {
+        THROW(NET, Error, ErrorCode::InvalidUsage, "invalid GID index ", gidIndex_, " for port ", portNum_,
+              " (max index is ", portAttr.gid_tbl_len - 1, ")");
+      }
+
+      union ibv_gid gid = {};
+      if (Verbs::ibv_query_gid(verbsCtx, portNum_, gidIndex_, &gid) != 0) {
+        THROW(NET, IbError, errno, "ibv_query_gid failed for port ", portNum_, " index ", gidIndex_, " (errno ", errno,
+              ")");
+      }
+      info_.spn = gid.global.subnet_prefix;
+      info_.iid = gid.global.interface_id;
+    }
+
+    struct ibv_qp_attr qpAttr = {};
+    qpAttr.qp_state = IBV_QPS_INIT;
+    qpAttr.pkey_index = 0;
+    qpAttr.port_num = portNum_;
+    qpAttr.qp_access_flags = noAtomic_ ? IBV_ACCESS_REMOTE_WRITE
+                                       : (IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_ATOMIC);
+    int ret =
+        Backend::modifyQp(qp_, &qpAttr, IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS, hint_);
+    if (ret != 0) {
+      THROW(NET, IbError, ret < 0 ? errno : ret, Backend::name, " modify QP failed");
+    }
+    sendWrs_ = std::make_shared<std::vector<ibv_send_wr>>(maxWrPerSend_);
+    sendSges_ = std::make_shared<std::vector<ibv_sge>>(maxWrPerSend_);
+    sendWcs_ = std::make_shared<std::vector<ibv_wc>>(maxSendCqPollNum_);
+    recvWcs_ = std::make_shared<std::vector<ibv_wc>>(maxRecvWr_);
+    if (maxRecvWr_ > 0) {
+      recvWrs_ = std::make_shared<std::vector<ibv_recv_wr>>(maxRecvWr_);
+      recvSges_ = std::make_shared<std::vector<ibv_sge>>(maxRecvWr_);
+    }
+  } catch (...) {
+    reset();
+    throw;
   }
 }
 
-IbQp::~IbQp() {
-  IBVerbs::ibv_destroy_qp(qp_);
-  IBVerbs::ibv_destroy_cq(sendCq_);
-  if (recvCq_ != nullptr) {
-    IBVerbs::ibv_destroy_cq(recvCq_);
-  }
+template <typename Backend>
+VerbsQp<Backend>::~VerbsQp() {
+  reset();
 }
 
-void IbQp::rtr(const IbQpInfo& info) {
+template <typename Backend>
+void VerbsQp<Backend>::reset() {
+  if (!detail::destroyQpAndHint<Backend>(qp_, hint_)) {
+    WARN(NET, Backend::name, " QP/hint cleanup failed; retaining dependent resources");
+    return;
+  }
+  if (sendCq_) Backend::destroyCq(sendCq_);
+  if (recvCq_) Backend::destroyCq(recvCq_);
+  qp_ = nullptr;
+  sendCq_ = recvCq_ = nullptr;
+}
+
+template <typename Backend>
+void VerbsQp<Backend>::rtr(const IbQpInfo& info) {
   struct ibv_qp_attr qp_attr = {};
   qp_attr.qp_state = IBV_QPS_RTR;
   qp_attr.path_mtu = static_cast<ibv_mtu>(info.mtu);
@@ -312,15 +489,16 @@ void IbQp::rtr(const IbQpInfo& info) {
   qp_attr.ah_attr.sl = 0;
   qp_attr.ah_attr.src_path_bits = 0;
   qp_attr.ah_attr.port_num = portNum_;
-  int ret = IBVerbs::ibv_modify_qp(qp_, &qp_attr,
-                                   IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
-                                       IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
+  int ret = Backend::modifyQp(qp_, &qp_attr,
+                              IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU | IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+                                  IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);
   if (ret != 0) {
-    THROW(NET, IbError, errno, "ibv_modify_qp failed (errno ", errno, ")");
+    THROW(NET, IbError, ret < 0 ? errno : ret, Backend::name, " modify QP failed");
   }
 }
 
-void IbQp::rts() {
+template <typename Backend>
+void VerbsQp<Backend>::rts() {
   struct ibv_qp_attr qp_attr = {};
   qp_attr.qp_state = IBV_QPS_RTS;
   qp_attr.timeout = 18;
@@ -328,15 +506,16 @@ void IbQp::rts() {
   qp_attr.rnr_retry = 7;
   qp_attr.sq_psn = 0;
   qp_attr.max_rd_atomic = noAtomic_ ? 0 : 1;
-  int ret = IBVerbs::ibv_modify_qp(
+  int ret = Backend::modifyQp(
       qp_, &qp_attr,
       IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC);
   if (ret != 0) {
-    THROW(NET, IbError, errno, "ibv_modify_qp failed (errno ", errno, ")");
+    THROW(NET, IbError, ret < 0 ? errno : ret, Backend::name, " modify QP failed");
   }
 }
 
-IbQp::SendWrInfo IbQp::getNewSendWrInfo() {
+template <typename Backend>
+typename VerbsQp<Backend>::SendWrInfo VerbsQp<Backend>::getNewSendWrInfo() {
   if (numStagedSend_ >= maxWrPerSend_) {
     THROW(NET, Error, ErrorCode::InvalidUsage, "too many staged work requests. limit is ", maxWrPerSend_);
   }
@@ -349,11 +528,12 @@ IbQp::SendWrInfo IbQp::getNewSendWrInfo() {
     (*sendWrs_)[numStagedSend_ - 1].next = wr_;
   }
   numStagedSend_++;
-  return IbQp::SendWrInfo{wr_, sge_};
+  return SendWrInfo{wr_, sge_};
 }
 
-void IbQp::stageSendWrite(const IbMr* mr, const IbMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
-                          uint64_t dstOffset, bool signaled) {
+template <typename Backend>
+void VerbsQp<Backend>::stageSendWrite(const IbMr* mr, const IbMrInfo& info, uint32_t size, uint64_t wrId,
+                                      uint64_t srcOffset, uint64_t dstOffset, bool signaled) {
   auto wrInfo = this->getNewSendWrInfo();
   wrInfo.wr->wr_id = wrId;
   wrInfo.wr->opcode = IBV_WR_RDMA_WRITE;
@@ -366,8 +546,12 @@ void IbQp::stageSendWrite(const IbMr* mr, const IbMrInfo& info, uint32_t size, u
   if (signaled) numStagedSignaledSend_++;
 }
 
-void IbQp::stageSendAtomicAdd(const IbMr* mr, const IbMrInfo& info, uint64_t wrId, uint64_t dstOffset, uint64_t addVal,
-                              bool signaled) {
+template <typename Backend>
+void VerbsQp<Backend>::stageSendAtomicAdd(const IbMr* mr, const IbMrInfo& info, uint64_t wrId, uint64_t dstOffset,
+                                          uint64_t addVal, bool signaled) {
+  if constexpr (Backend::nativeMrc) {
+    THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC does not support network atomics");
+  }
   auto wrInfo = this->getNewSendWrInfo();
   wrInfo.wr->wr_id = wrId;
   wrInfo.wr->opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
@@ -381,8 +565,10 @@ void IbQp::stageSendAtomicAdd(const IbMr* mr, const IbMrInfo& info, uint64_t wrI
   if (signaled) numStagedSignaledSend_++;
 }
 
-void IbQp::stageSendWriteWithImm(const IbMr* mr, const IbMrInfo& info, uint32_t size, uint64_t wrId, uint64_t srcOffset,
-                                 uint64_t dstOffset, bool signaled, unsigned int immData) {
+template <typename Backend>
+void VerbsQp<Backend>::stageSendWriteWithImm(const IbMr* mr, const IbMrInfo& info, uint32_t size, uint64_t wrId,
+                                             uint64_t srcOffset, uint64_t dstOffset, bool signaled,
+                                             unsigned int immData) {
   auto wrInfo = this->getNewSendWrInfo();
   wrInfo.wr->wr_id = wrId;
   wrInfo.wr->opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
@@ -403,25 +589,27 @@ void IbQp::stageSendWriteWithImm(const IbMr* mr, const IbMrInfo& info, uint32_t 
   if (signaled) numStagedSignaledSend_++;
 }
 
-void IbQp::postSend() {
+template <typename Backend>
+void VerbsQp<Backend>::postSend() {
   if (numStagedSend_ == 0) {
     return;
   }
   struct ibv_send_wr* bad_wr;
-  int err = IBVerbs::ibv_post_send(qp_, sendWrs_->data(), &bad_wr);
+  int err = Backend::postSend(qp_, sendWrs_->data(), &bad_wr);
   if (err != 0) {
-    THROW(NET, IbError, err, "ibv_post_send failed (errno ", err, ")");
+    THROW(NET, IbError, err < 0 ? errno : err, Backend::name, " post send failed");
   }
   numStagedSend_ = 0;
   numPostedSignaledSend_ += numStagedSignaledSend_;
   numStagedSignaledSend_ = 0;
   if (numPostedSignaledSend_ + 4 > maxSendCqSize_) {
-    INFO(NET, "IB: CQ is almost full (", numPostedSignaledSend_, " / ", maxSendCqSize_,
+    INFO(NET, Backend::name, ": CQ is almost full (", numPostedSignaledSend_, " / ", maxSendCqSize_,
          "). The connection needs to be flushed to prevent timeout errors.");
   }
 }
 
-IbQp::RecvWrInfo IbQp::getNewRecvWrInfo() {
+template <typename Backend>
+typename VerbsQp<Backend>::RecvWrInfo VerbsQp<Backend>::getNewRecvWrInfo() {
   if (numStagedRecv_ >= maxRecvWr_) {
     THROW(NET, Error, ErrorCode::InvalidUsage, "too many outstanding recv work requests. limit is ", maxRecvWr_);
   }
@@ -432,10 +620,11 @@ IbQp::RecvWrInfo IbQp::getNewRecvWrInfo() {
     (*recvWrs_)[numStagedRecv_ - 1].next = wr;
   }
   numStagedRecv_++;
-  return IbQp::RecvWrInfo{wr, sge};
+  return RecvWrInfo{wr, sge};
 }
 
-void IbQp::stageRecv(uint64_t wrId) {
+template <typename Backend>
+void VerbsQp<Backend>::stageRecv(uint64_t wrId) {
   auto wrInfo = this->getNewRecvWrInfo();
   // For RDMA write-with-imm, data goes to remote_addr specified by sender.
   // We only need the recv WR to get the completion notification with imm_data.
@@ -444,7 +633,8 @@ void IbQp::stageRecv(uint64_t wrId) {
   wrInfo.wr->num_sge = 0;
 }
 
-void IbQp::stageRecv(const IbMr* mr, uint64_t wrId, uint32_t size, uint64_t offset) {
+template <typename Backend>
+void VerbsQp<Backend>::stageRecv(const IbMr* mr, uint64_t wrId, uint32_t size, uint64_t offset) {
   auto wrInfo = this->getNewRecvWrInfo();
   wrInfo.wr->wr_id = wrId;
   wrInfo.sge->addr = reinterpret_cast<uint64_t>(mr->getBuff()) + offset;
@@ -454,120 +644,174 @@ void IbQp::stageRecv(const IbMr* mr, uint64_t wrId, uint32_t size, uint64_t offs
   wrInfo.wr->num_sge = 1;
 }
 
-void IbQp::postRecv() {
+template <typename Backend>
+void VerbsQp<Backend>::postRecv() {
   if (numStagedRecv_ == 0) return;
   struct ibv_recv_wr* bad_wr;
-  int err = IBVerbs::ibv_post_recv(qp_, recvWrs_->data(), &bad_wr);
+  int err = Backend::postRecv(qp_, recvWrs_->data(), &bad_wr);
   if (err != 0) {
-    THROW(NET, IbError, err, "ibv_post_recv failed (errno ", err, ")");
+    THROW(NET, IbError, err < 0 ? errno : err, Backend::name, " post recv failed");
   }
   numStagedRecv_ = 0;
 }
 
-int IbQp::pollSendCq() {
-  int wcNum = IBVerbs::ibv_poll_cq(sendCq_, maxSendCqPollNum_, sendWcs_->data());
+template <typename Backend>
+int VerbsQp<Backend>::pollSendCq() {
+  int wcNum = Backend::pollCq(sendCq_, maxSendCqPollNum_, sendWcs_->data());
   if (wcNum > 0) {
     numPostedSignaledSend_ -= wcNum;
   }
   return wcNum;
 }
 
-int IbQp::pollRecvCq() {
-  int wcNum = IBVerbs::ibv_poll_cq(recvCq_, maxRecvWr_, recvWcs_->data());
+template <typename Backend>
+int VerbsQp<Backend>::pollRecvCq() {
+  int wcNum = Backend::pollCq(recvCq_, maxRecvWr_, recvWcs_->data());
   return wcNum;
 }
 
-int IbQp::getSendWcStatus(int idx) const { return (*sendWcs_)[idx].status; }
+template <typename Backend>
+int VerbsQp<Backend>::getSendWcStatus(int idx) const {
+  return (*sendWcs_)[idx].status;
+}
 
-std::string IbQp::getSendWcStatusString(int idx) const { return IBVerbs::ibv_wc_status_str((*sendWcs_)[idx].status); }
+template <typename Backend>
+std::string VerbsQp<Backend>::getSendWcStatusString(int idx) const {
+  return Verbs::ibv_wc_status_str((*sendWcs_)[idx].status);
+}
 
-int IbQp::getNumSendCqItems() const { return numPostedSignaledSend_; }
+template <typename Backend>
+int VerbsQp<Backend>::getNumSendCqItems() const {
+  return numPostedSignaledSend_;
+}
 
-int IbQp::getRecvWcStatus(int idx) const { return (*recvWcs_)[idx].status; }
+template <typename Backend>
+int VerbsQp<Backend>::getRecvWcStatus(int idx) const {
+  return (*recvWcs_)[idx].status;
+}
 
-std::string IbQp::getRecvWcStatusString(int idx) const { return IBVerbs::ibv_wc_status_str((*recvWcs_)[idx].status); }
+template <typename Backend>
+std::string VerbsQp<Backend>::getRecvWcStatusString(int idx) const {
+  return Verbs::ibv_wc_status_str((*recvWcs_)[idx].status);
+}
 
-unsigned int IbQp::getRecvWcImmData(int idx) const { return ntohl((*recvWcs_)[idx].imm_data); }
+template <typename Backend>
+unsigned int VerbsQp<Backend>::getRecvWcImmData(int idx) const {
+  return ntohl((*recvWcs_)[idx].imm_data);
+}
 
-IbCtx::IbCtx(const std::string& devName)
+template <typename Backend>
+VerbsCtx<Backend>::VerbsCtx(const std::string& devName)
     : devName_(devName),
+      verbsCtx_(nullptr),
       ctx_(nullptr),
       pd_(nullptr),
       supportsRdmaAtomics_(false),
       isMlx5_(false),
       isDataDirect_(false),
       isVF_(false) {
-  int num;
-  struct ibv_device** devices = IBVerbs::ibv_get_device_list(&num);
-  for (int i = 0; i < num; ++i) {
-    if (std::string(devices[i]->name) == devName_) {
-      ctx_ = IBVerbs::ibv_open_device(devices[i]);
-
-      // Detect if this IB device is a Virtual Function (VF).
-      // VFs have a 'physfn' sysfs symlink pointing to their parent PF; PFs do not.
-      {
-        std::string physfnPath = "/sys/class/infiniband/" + devName_ + "/device/physfn";
-        isVF_ = (access(physfnPath.c_str(), F_OK) == 0);
-        if (isVF_) {
-          INFO(NET, "IB device ", devName_, " is a Virtual Function (Data Direct ordering available)");
-        }
-      }
-
-#if defined(MSCCLPP_USE_MLX5DV)
-      if (MLX5DV::isAvailable()) {
-        isMlx5_ = MLX5DV::mlx5dv_is_supported(devices[i]);
-        if (isMlx5_) {
-          INFO(NET, "IB device ", devName_, " supports mlx5 Direct Verbs");
-        }
-      }
-#endif  // defined(MSCCLPP_USE_MLX5DV)
-      break;
+  try {
+    int num = 0;
+    struct ibv_device** devices = Verbs::ibv_get_device_list(&num);
+    auto freeDevices = [](ibv_device** devices) { Verbs::ibv_free_device_list(devices); };
+    std::unique_ptr<ibv_device*, decltype(freeDevices)> deviceList(devices, freeDevices);
+    if (!devices) {
+      THROW(NET, IbError, errno, "ibv_get_device_list failed");
     }
-  }
-  IBVerbs::ibv_free_device_list(devices);
-  if (ctx_ == nullptr) {
-    THROW(NET, IbError, errno, "ibv_open_device failed (errno ", errno, ", device name ", devName_, ")");
-  }
-  pd_ = IBVerbs::ibv_alloc_pd(ctx_);
-  if (pd_ == nullptr) {
-    THROW(NET, IbError, errno, "ibv_alloc_pd failed (errno ", errno, ")");
-  }
+    for (int i = 0; i < num; ++i) {
+      if (std::string(devices[i]->name) == devName_) {
+        verbsCtx_ = Verbs::ibv_open_device(devices[i]);
 
-  // Detect Data Direct support via mlx5dv_get_data_direct_sysfs_path
+        // Detect if this IB device is a Virtual Function (VF).
+        // VFs have a 'physfn' sysfs symlink pointing to their parent PF; PFs do not.
+        {
+          std::string physfnPath = "/sys/class/infiniband/" + devName_ + "/device/physfn";
+          isVF_ = (access(physfnPath.c_str(), F_OK) == 0);
+          if (isVF_) {
+            INFO(NET, Backend::name, " device ", devName_, " is a Virtual Function (Data Direct ordering available)");
+          }
+        }
+
 #if defined(MSCCLPP_USE_MLX5DV)
-  if (isMlx5_ && MLX5DV::isAvailable()) {
-    char sysfsPath[256];
-    int ret = MLX5DV::mlx5dv_get_data_direct_sysfs_path(ctx_, sysfsPath, sizeof(sysfsPath));
-    if (ret == 0) {
-      isDataDirect_ = true;
-      INFO(NET, "IB device ", devName_, " supports Data Direct (sysfs: ", sysfsPath, ")");
+        if (MLX5DV::isAvailable()) {
+          isMlx5_ = MLX5DV::mlx5dv_is_supported(devices[i]);
+          if (isMlx5_) {
+            INFO(NET, Backend::name, " device ", devName_, " supports mlx5 Direct Verbs");
+          }
+        }
+#endif  // defined(MSCCLPP_USE_MLX5DV)
+        break;
+      }
+    }
+    deviceList.reset();
+    if (verbsCtx_ == nullptr) {
+      THROW(NET, IbError, errno, "ibv_open_device failed (errno ", errno, ", device name ", devName_, ")");
+    }
+    ctx_ = Backend::createContext(verbsCtx_);
+    if (ctx_ == nullptr) {
+      THROW(NET, IbError, errno, Backend::name, " create context failed (device ", devName_, ")");
+    }
+    pd_ = Verbs::ibv_alloc_pd(verbsCtx_);
+    if (pd_ == nullptr) {
+      THROW(NET, IbError, errno, "ibv_alloc_pd failed (errno ", errno, ")");
+    }
+
+    // Detect Data Direct support via mlx5dv_get_data_direct_sysfs_path
+#if defined(MSCCLPP_USE_MLX5DV)
+    if (isMlx5_ && MLX5DV::isAvailable()) {
+      char sysfsPath[256];
+      int ret = MLX5DV::mlx5dv_get_data_direct_sysfs_path(verbsCtx_, sysfsPath, sizeof(sysfsPath));
+      if (ret == 0) {
+        isDataDirect_ = true;
+        INFO(NET, Backend::name, " device ", devName_, " supports Data Direct (sysfs: ", sysfsPath, ")");
+      } else {
+        INFO(NET, Backend::name, " device ", devName_, " does not support Data Direct");
+      }
+    }
+#endif  // defined(MSCCLPP_USE_MLX5DV)
+
+    // Query and cache RDMA atomics capability
+    if constexpr (!Backend::nativeMrc) {
+      struct ibv_device_attr attr = {};
+      if (Verbs::ibv_query_device(verbsCtx_, &attr) == 0) {
+        supportsRdmaAtomics_ = (attr.atomic_cap == IBV_ATOMIC_HCA || attr.atomic_cap == IBV_ATOMIC_GLOB);
+      }
     } else {
-      INFO(NET, "IB device ", devName_, " does not support Data Direct");
+      INFO(NET, "Native MRC context on ", devName_, " using mrc_* API (no verbs shim or network atomics)");
     }
-  }
-#endif  // defined(MSCCLPP_USE_MLX5DV)
-
-  // Query and cache RDMA atomics capability
-  struct ibv_device_attr attr = {};
-  if (IBVerbs::ibv_query_device(ctx_, &attr) == 0) {
-    supportsRdmaAtomics_ = (attr.atomic_cap == IBV_ATOMIC_HCA || attr.atomic_cap == IBV_ATOMIC_GLOB);
+  } catch (...) {
+    reset();
+    throw;
   }
 }
 
-IbCtx::~IbCtx() {
+template <typename Backend>
+VerbsCtx<Backend>::~VerbsCtx() {
+  reset();
+}
+
+template <typename Backend>
+void VerbsCtx<Backend>::reset() {
   // Opened on pd_.
   gpuNetIoDevice_.reset();
-  if (pd_ != nullptr) {
-    IBVerbs::ibv_dealloc_pd(pd_);
+  if (ctx_) {
+    Backend::destroyContext(ctx_);
+    ctx_ = nullptr;
   }
-  if (ctx_ != nullptr) {
-    IBVerbs::ibv_close_device(ctx_);
+  if (pd_ != nullptr) {
+    Verbs::ibv_dealloc_pd(pd_);
+    pd_ = nullptr;
+  }
+  if (verbsCtx_ != nullptr) {
+    Verbs::ibv_close_device(verbsCtx_);
+    verbsCtx_ = nullptr;
   }
 }
 
-bool IbCtx::isPortUsable(int port, int gidIndex) const {
+template <typename Backend>
+bool VerbsCtx<Backend>::isPortUsable(int port, int gidIndex) const {
   struct ibv_port_attr portAttr = {};
-  if (IBVerbs::ibv_query_port(ctx_, port, &portAttr) != 0) {
+  if (Verbs::ibv_query_port(verbsCtx_, port, &portAttr) != 0) {
     THROW(NET, IbError, errno, "ibv_query_port failed (errno ", errno, ", port ", port, ")");
   }
 
@@ -586,7 +830,7 @@ bool IbCtx::isPortUsable(int port, int gidIndex) const {
         return false;
       }
       union ibv_gid gid = {};
-      if (IBVerbs::ibv_query_gid(ctx_, port, gidIndex, &gid) != 0) {
+      if (Verbs::ibv_query_gid(verbsCtx_, port, gidIndex, &gid) != 0) {
         return false;
       }
     }
@@ -595,9 +839,10 @@ bool IbCtx::isPortUsable(int port, int gidIndex) const {
   return true;
 }
 
-int IbCtx::getAnyUsablePort(int gidIndex) const {
+template <typename Backend>
+int VerbsCtx<Backend>::getAnyUsablePort(int gidIndex) const {
   struct ibv_device_attr devAttr;
-  if (IBVerbs::ibv_query_device(ctx_, &devAttr) != 0) {
+  if (Verbs::ibv_query_device(verbsCtx_, &devAttr) != 0) {
     THROW(NET, IbError, errno, "ibv_query_device failed (errno ", errno, ")");
   }
   for (uint8_t port = 1; port <= devAttr.phys_port_cnt; ++port) {
@@ -608,8 +853,10 @@ int IbCtx::getAnyUsablePort(int gidIndex) const {
   return -1;
 }
 
-std::shared_ptr<IbQp> IbCtx::createQp(int port, int gidIndex, int maxSendCqSize, int maxSendCqPollNum, int maxSendWr,
-                                      int maxRecvWr, int maxWrPerSend, bool noAtomic) {
+template <typename Backend>
+std::shared_ptr<VerbsQp<Backend>> VerbsCtx<Backend>::createQp(int port, int gidIndex, int maxSendCqSize,
+                                                              int maxSendCqPollNum, int maxSendWr, int maxRecvWr,
+                                                              int maxWrPerSend, bool noAtomic) {
   if (port == -1) {
     port = this->getAnyUsablePort(gidIndex);
     if (port == -1) {
@@ -618,11 +865,13 @@ std::shared_ptr<IbQp> IbCtx::createQp(int port, int gidIndex, int maxSendCqSize,
   } else if (!this->isPortUsable(port, gidIndex)) {
     THROW(NET, Error, ErrorCode::InvalidUsage, "invalid IB port: ", port);
   }
-  return std::shared_ptr<IbQp>(new IbQp(ctx_, pd_, port, gidIndex, maxSendCqSize, maxSendCqPollNum, maxSendWr,
-                                        maxRecvWr, maxWrPerSend, noAtomic));
+  return std::shared_ptr<VerbsQp<Backend>>(new VerbsQp<Backend>(ctx_, verbsCtx_, pd_, port, gidIndex, maxSendCqSize,
+                                                                maxSendCqPollNum, maxSendWr, maxRecvWr, maxWrPerSend,
+                                                                noAtomic || Backend::nativeMrc));
 }
 
-IbQpInfo IbCtx::getPortInfo(int& port, int gidIndex) const {
+template <typename Backend>
+IbQpInfo VerbsCtx<Backend>::getPortInfo(int& port, int gidIndex) const {
   if (port == -1) {
     port = this->getAnyUsablePort(gidIndex);
     if (port == -1) {
@@ -632,7 +881,7 @@ IbQpInfo IbCtx::getPortInfo(int& port, int gidIndex) const {
     THROW(NET, Error, ErrorCode::InvalidUsage, "invalid IB port: ", port);
   }
   struct ibv_port_attr portAttr;
-  if (IBVerbs::ibv_query_port(ctx_, port, &portAttr) != 0) {
+  if (Verbs::ibv_query_port(verbsCtx_, port, &portAttr) != 0) {
     THROW(NET, IbError, errno, "ibv_query_port failed (errno ", errno, ")");
   }
   IbQpInfo info = {};
@@ -646,7 +895,7 @@ IbQpInfo IbCtx::getPortInfo(int& port, int gidIndex) const {
             portAttr.gid_tbl_len - 1, ")");
     }
     union ibv_gid gid = {};
-    if (IBVerbs::ibv_query_gid(ctx_, port, gidIndex, &gid) != 0) {
+    if (Verbs::ibv_query_gid(verbsCtx_, port, gidIndex, &gid) != 0) {
       THROW(NET, IbError, errno, "ibv_query_gid failed for port ", port, " index ", gidIndex, " (errno ", errno, ")");
     }
     info.spn = gid.global.subnet_prefix;
@@ -655,17 +904,30 @@ IbQpInfo IbCtx::getPortInfo(int& port, int gidIndex) const {
   return info;
 }
 
-std::unique_ptr<const IbMr> IbCtx::registerMr(void* buff, std::size_t size) {
-  return std::unique_ptr<const IbMr>(new IbMr(pd_, buff, size, isDataDirect_));
+template <typename Backend>
+std::unique_ptr<const IbMr> VerbsCtx<Backend>::registerMr(void* buff, std::size_t size) {
+  return std::unique_ptr<const IbMr>(new IbMr(pd_, buff, size, isDataDirect_, Backend::nativeMrc));
 }
 
-bool IbCtx::supportsRdmaAtomics() const { return supportsRdmaAtomics_; }
+template <typename Backend>
+bool VerbsCtx<Backend>::supportsRdmaAtomics() const {
+  return supportsRdmaAtomics_;
+}
 
-bool IbCtx::isMlx5() const { return isMlx5_; }
+template <typename Backend>
+bool VerbsCtx<Backend>::isMlx5() const {
+  return isMlx5_;
+}
 
-bool IbCtx::isDataDirect() const { return isDataDirect_; }
+template <typename Backend>
+bool VerbsCtx<Backend>::isDataDirect() const {
+  return isDataDirect_;
+}
 
-bool IbCtx::isVirtualFunction() const { return isVF_; }
+template <typename Backend>
+bool VerbsCtx<Backend>::isVirtualFunction() const {
+  return isVF_;
+}
 
 MSCCLPP_API_CPP int getIBDeviceCount() {
   int num = 0;
@@ -693,48 +955,30 @@ std::string getHcaDevices(int deviceIndex) {
   return "";
 }
 
-MSCCLPP_API_CPP std::string getIBDeviceName(Transport ibTransport) {
-  int ibTransportIndex;
-  switch (ibTransport) {  // TODO: get rid of this ugly switch
-    case Transport::IB0:
-      ibTransportIndex = 0;
-      break;
-    case Transport::IB1:
-      ibTransportIndex = 1;
-      break;
-    case Transport::IB2:
-      ibTransportIndex = 2;
-      break;
-    case Transport::IB3:
-      ibTransportIndex = 3;
-      break;
-    case Transport::IB4:
-      ibTransportIndex = 4;
-      break;
-    case Transport::IB5:
-      ibTransportIndex = 5;
-      break;
-    case Transport::IB6:
-      ibTransportIndex = 6;
-      break;
-    case Transport::IB7:
-      ibTransportIndex = 7;
-      break;
-    default:
-      THROW(NET, Error, ErrorCode::InvalidUsage, "Not an IB transport");
+template <typename Backend>
+static std::string getVerbsDeviceName(Transport transport) {
+  using Verbs = typename Backend::Verbs;
+  const auto transports = Backend::nativeMrc ? AllMRCTransports : AllIBTransports;
+  if (!transports.has(transport)) {
+    THROW(NET, Error, ErrorCode::InvalidUsage, "Not an ", Backend::name, " transport");
   }
-  std::string userHcaDevice = getHcaDevices(ibTransportIndex);
+  int deviceIndex = static_cast<int>(transport) - static_cast<int>(Backend::firstTransport);
+  std::string userHcaDevice = getHcaDevices(deviceIndex);
   if (!userHcaDevice.empty()) {
     return userHcaDevice;
   }
 
-  int num;
-  struct ibv_device** devices = IBVerbs::ibv_get_device_list(&num);
-  if (ibTransportIndex >= num) {
-    THROW(NET, Error, ErrorCode::InvalidUsage, "IB transport out of range: ", ibTransportIndex, " >= ", num);
+  int num = 0;
+  struct ibv_device** devices = Verbs::ibv_get_device_list(&num);
+  auto freeDevices = [](ibv_device** devices) { Verbs::ibv_free_device_list(devices); };
+  std::unique_ptr<ibv_device*, decltype(freeDevices)> deviceList(devices, freeDevices);
+  if (!devices || deviceIndex >= num) {
+    THROW(NET, Error, ErrorCode::InvalidUsage, Backend::name, " transport out of range: ", deviceIndex, " >= ", num);
   }
-  return devices[ibTransportIndex]->name;
+  return devices[deviceIndex]->name;
 }
+
+MSCCLPP_API_CPP std::string getIBDeviceName(Transport ibTransport) { return getVerbsDeviceName<Ib>(ibTransport); }
 
 MSCCLPP_API_CPP Transport getIBTransportByDeviceName(const std::string& ibDeviceName) {
   int num;
@@ -779,36 +1023,73 @@ IbMrInfo IbMr::getInfo() const { return IbMrInfo(); }
 const void* IbMr::getBuff() const { return nullptr; }
 uint32_t IbMr::getLkey() const { return 0; }
 
-IbQp::~IbQp() {}
-void IbQp::rtr(const IbQpInfo& /*info*/) {}
-void IbQp::rts() {}
-void IbQp::stageSendWrite(const IbMr* /*mr*/, const IbMrInfo& /*info*/, uint32_t /*size*/, uint64_t /*wrId*/,
-                          uint64_t /*srcOffset*/, uint64_t /*dstOffset*/, bool /*signaled*/) {}
-void IbQp::stageSendAtomicAdd(const IbMr* /*mr*/, const IbMrInfo& /*info*/, uint64_t /*wrId*/, uint64_t /*dstOffset*/,
-                              uint64_t /*addVal*/, bool /*signaled*/) {}
-void IbQp::stageSendWriteWithImm(const IbMr* /*mr*/, const IbMrInfo& /*info*/, uint32_t /*size*/, uint64_t /*wrId*/,
-                                 uint64_t /*srcOffset*/, uint64_t /*dstOffset*/, bool /*signaled*/,
-                                 unsigned int /*immData*/) {}
-void IbQp::postSend() {}
-void IbQp::stageRecv(uint64_t /*wrId*/) {}
-void IbQp::stageRecv(const IbMr* /*mr*/, uint64_t /*wrId*/, uint32_t /*size*/, uint64_t /*offset*/) {}
-void IbQp::postRecv() {}
-int IbQp::pollSendCq() { return 0; }
-int IbQp::pollRecvCq() { return 0; }
-int IbQp::getSendWcStatus(int /*idx*/) const { return 0; }
-std::string IbQp::getSendWcStatusString(int /*idx*/) const { return ""; }
-int IbQp::getNumSendCqItems() const { return 0; }
-int IbQp::getRecvWcStatus(int /*idx*/) const { return 0; }
-std::string IbQp::getRecvWcStatusString(int /*idx*/) const { return ""; }
-unsigned int IbQp::getRecvWcImmData(int /*idx*/) const { return 0; }
+template <typename Backend>
+VerbsQp<Backend>::~VerbsQp() {}
+template <typename Backend>
+void VerbsQp<Backend>::rtr(const IbQpInfo&) {}
+template <typename Backend>
+void VerbsQp<Backend>::rts() {}
+template <typename Backend>
+void VerbsQp<Backend>::stageSendWrite(const IbMr*, const IbMrInfo&, uint32_t, uint64_t, uint64_t, uint64_t, bool) {}
+template <typename Backend>
+void VerbsQp<Backend>::stageSendAtomicAdd(const IbMr*, const IbMrInfo&, uint64_t, uint64_t, uint64_t, bool) {}
+template <typename Backend>
+void VerbsQp<Backend>::stageSendWriteWithImm(const IbMr*, const IbMrInfo&, uint32_t, uint64_t, uint64_t, uint64_t, bool,
+                                             unsigned int) {}
+template <typename Backend>
+void VerbsQp<Backend>::postSend() {}
+template <typename Backend>
+void VerbsQp<Backend>::stageRecv(uint64_t) {}
+template <typename Backend>
+void VerbsQp<Backend>::stageRecv(const IbMr*, uint64_t, uint32_t, uint64_t) {}
+template <typename Backend>
+void VerbsQp<Backend>::postRecv() {}
+template <typename Backend>
+int VerbsQp<Backend>::pollSendCq() {
+  return 0;
+}
+template <typename Backend>
+int VerbsQp<Backend>::pollRecvCq() {
+  return 0;
+}
+template <typename Backend>
+int VerbsQp<Backend>::getSendWcStatus(int) const {
+  return 0;
+}
+template <typename Backend>
+std::string VerbsQp<Backend>::getSendWcStatusString(int) const {
+  return "";
+}
+template <typename Backend>
+int VerbsQp<Backend>::getNumSendCqItems() const {
+  return 0;
+}
+template <typename Backend>
+int VerbsQp<Backend>::getRecvWcStatus(int) const {
+  return 0;
+}
+template <typename Backend>
+std::string VerbsQp<Backend>::getRecvWcStatusString(int) const {
+  return "";
+}
+template <typename Backend>
+unsigned int VerbsQp<Backend>::getRecvWcImmData(int) const {
+  return 0;
+}
+
+template <typename Backend>
+static std::string getVerbsDeviceName(Transport) {
+  return "";
+}
 
 #endif  // !defined(USE_IBVERBS)
 
-class IBConnection : public BaseConnection {
+template <typename Backend>
+class VerbsConnection : public BaseConnection {
  private:
   Transport transport_;
   Transport remoteTransport_;
-  std::weak_ptr<IbQp> qp_;
+  std::weak_ptr<VerbsQp<Backend>> qp_;
   std::unique_ptr<uint64_t> atomicSrc_;
   RegisteredMemory atomicSrcMem_;
   const IbMr* atomicSrcMr_ = nullptr;
@@ -836,8 +1117,8 @@ class IBConnection : public BaseConnection {
   void recvThreadFunc();
 
  public:
-  IBConnection(std::shared_ptr<Context> context, const Endpoint& localEndpoint, const Endpoint& remoteEndpoint);
-  ~IBConnection();
+  VerbsConnection(std::shared_ptr<Context> context, const Endpoint& localEndpoint, const Endpoint& remoteEndpoint);
+  ~VerbsConnection();
 
   /// Start signal forwarding to the given memory address.
   /// Must be called before the remote sends any updateAndSync in HostNoAtomic mode.
@@ -871,28 +1152,34 @@ IbMemory::IbMemory(const IbMrInfo& info) { std::memcpy(&info_, &info, sizeof(inf
 
 void IbMemory::serialize(std::vector<char>& data) const { detail::serialize(data, info_); }
 
-IbEndpoint::IbEndpoint(std::shared_ptr<RdmaProvider> provider, IbCtx& context, EndpointConfig& config)
-    : RdmaEndpoint(std::move(provider)), context_(&context), noAtomic_(false) {
+template <typename Backend>
+VerbsEndpoint<Backend>::VerbsEndpoint(std::shared_ptr<RdmaProvider> provider, VerbsCtx<Backend>& context,
+                                      EndpointConfig& config)
+    : RdmaEndpoint(std::move(provider)), context_(&context), noAtomic_(Backend::nativeMrc) {
   if (config.maxWriteQueueSize <= 0) {
     config.maxWriteQueueSize = config.ib.maxCqSize;
   }
 
   if (config.ib.mode == EndpointConfig::Ib::Mode::Device) {
-    if (config.device.type != DeviceType::GPU) {
-      THROW(NET, Error, ErrorCode::InvalidUsage, "IB Device mode requires a GPU endpoint");
+    if constexpr (Backend::nativeMrc) {
+      THROW(NET, Error, ErrorCode::InvalidUsage, "Native MRC does not support Device mode");
+    } else {
+      if (config.device.type != DeviceType::GPU) {
+        THROW(NET, Error, ErrorCode::InvalidUsage, "IB Device mode requires a GPU endpoint");
+      }
+      if (config.ib.gidIndex < 0) {
+        config.ib.gidIndex = env()->ibGidIndex;
+      }
+      gpuNetIoQp_ = std::make_shared<GpuNetIoQp>(context, config.device.id, config.ib.port, config.ib.gidIndex);
+      std::memcpy(&info_, &gpuNetIoQp_->info(), sizeof(info_));
+      return;
     }
-    if (config.ib.gidIndex < 0) {
-      config.ib.gidIndex = env()->ibGidIndex;
-    }
-    gpuNetIoQp_ = std::make_shared<GpuNetIoQp>(context, config.device.id, config.ib.port, config.ib.gidIndex);
-    std::memcpy(&info_, &gpuNetIoQp_->info(), sizeof(info_));
-    return;
   }
 
   if (config.ib.mode == EndpointConfig::Ib::Mode::HostNoAtomic) {
     noAtomic_ = true;
   } else if (config.ib.mode == EndpointConfig::Ib::Mode::Default) {
-    noAtomic_ = (env()->ibvMode == "host-no-atomic");
+    noAtomic_ = Backend::nativeMrc || (env()->ibvMode == "host-no-atomic");
   }
 
   if (!noAtomic_ && !context.supportsRdmaAtomics()) {
@@ -911,58 +1198,87 @@ IbEndpoint::IbEndpoint(std::shared_ptr<RdmaProvider> provider, IbCtx& context, E
   std::memcpy(&info_, &qp_->getInfo(), sizeof(info_));
 }
 
-IbEndpoint::IbEndpoint(const IbQpInfo& info, bool noAtomic) : noAtomic_(noAtomic) {
+template <typename Backend>
+VerbsEndpoint<Backend>::VerbsEndpoint(const IbQpInfo& info, bool noAtomic) : noAtomic_(noAtomic) {
   std::memcpy(&info_, &info, sizeof(info_));
 }
 
-void IbEndpoint::serialize(std::vector<char>& data) const {
+template <typename Backend>
+void VerbsEndpoint<Backend>::serialize(std::vector<char>& data) const {
   detail::serialize(data, info_);
   detail::serialize(data, noAtomic_);
 }
 
-std::shared_ptr<BaseConnection> IbEndpoint::createConnection(std::shared_ptr<Context> context, const Endpoint& local,
-                                                             const Endpoint& remote) const {
+template <typename Backend>
+std::shared_ptr<BaseConnection> VerbsEndpoint<Backend>::createConnection(std::shared_ptr<Context> context,
+                                                                         const Endpoint& local,
+                                                                         const Endpoint& remote) const {
   if (!isLocal()) {
-    THROW(CONN, Error, ErrorCode::InvalidUsage, "Cannot create a connection from a remote IB endpoint");
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "Cannot create a connection from a remote ", Backend::name,
+          " endpoint");
   }
-  if (gpuNetIoQp_) {
-    return std::make_shared<GpuNetIoConnection>(std::move(context), local, remote);
+  if constexpr (!Backend::nativeMrc) {
+    if (gpuNetIoQp_) {
+      return std::make_shared<GpuNetIoConnection>(std::move(context), local, remote);
+    }
   }
-  return std::make_shared<IBConnection>(std::move(context), local, remote);
+  return std::make_shared<VerbsConnection<Backend>>(std::move(context), local, remote);
 }
 
-IbProvider::IbProvider(Transport transport) : context_(getIBDeviceName(transport)) {}
+template <typename Backend>
+VerbsProvider<Backend>::VerbsProvider(Transport transport) : context_(getVerbsDeviceName<Backend>(transport)) {}
 
-std::shared_ptr<RdmaEndpoint> IbProvider::createEndpoint(EndpointConfig& config) {
-  return std::make_shared<IbEndpoint>(shared_from_this(), context_, config);
+template <typename Backend>
+std::shared_ptr<RdmaEndpoint> VerbsProvider<Backend>::createEndpoint(EndpointConfig& config) {
+  return std::make_shared<VerbsEndpoint<Backend>>(shared_from_this(), context_, config);
 }
 
-std::shared_ptr<RdmaMemory> IbProvider::registerMemory(void* data, size_t size) {
+template <typename Backend>
+std::shared_ptr<RdmaMemory> VerbsProvider<Backend>::registerMemory(void* data, size_t size) {
   return std::make_shared<IbMemory>(shared_from_this(), context_.registerMr(data, size));
 }
 
-const IbEndpoint& getIbEndpoint(const RdmaEndpoint& endpoint) {
-  const auto* ibEndpoint = dynamic_cast<const IbEndpoint*>(&endpoint);
-  if (!ibEndpoint) {
-    THROW(CONN, Error, ErrorCode::InvalidUsage, "Expected an IB endpoint");
+template <typename Backend>
+static const VerbsEndpoint<Backend>& getVerbsEndpoint(const RdmaEndpoint& endpoint) {
+  const auto* verbsEndpoint = dynamic_cast<const VerbsEndpoint<Backend>*>(&endpoint);
+  if (!verbsEndpoint) {
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "Expected an ", Backend::name, " endpoint");
   }
-  return *ibEndpoint;
+  return *verbsEndpoint;
+}
+
+const IbEndpoint& getIbEndpoint(const RdmaEndpoint& endpoint) { return getVerbsEndpoint<Ib>(endpoint); }
+
+static const IbMemory& getVerbsMemory(const TransportInfo& info) {
+  if (!getRdmaTransports().has(info.transport) || !info.rdmaMemory) {
+    THROW(NET, Error, ErrorCode::InvalidUsage, "Expected verbs memory");
+  }
+  // Both native backends bind transport records to the same MR representation.
+  return static_cast<const IbMemory&>(*info.rdmaMemory);
 }
 
 const IbMemory& getIbMemory(const TransportInfo& info) {
   if (!AllIBTransports.has(info.transport) || !info.rdmaMemory) {
     THROW(NET, Error, ErrorCode::InvalidUsage, "Expected IB memory");
   }
-  // Registration/import bind IB transport records to IbMemory.
-  return static_cast<const IbMemory&>(*info.rdmaMemory);
+  return getVerbsMemory(info);
 }
 
-std::shared_ptr<RdmaEndpoint> deserializeIbEndpoint(std::vector<char>::const_iterator& it) {
+template <typename Backend>
+static std::shared_ptr<RdmaEndpoint> deserializeVerbsEndpoint(std::vector<char>::const_iterator& it) {
   IbQpInfo info;
   bool noAtomic;
   it = detail::deserialize(it, info);
   it = detail::deserialize(it, noAtomic);
-  return std::make_shared<IbEndpoint>(info, noAtomic);
+  return std::make_shared<VerbsEndpoint<Backend>>(info, noAtomic);
+}
+
+std::shared_ptr<RdmaEndpoint> deserializeIbEndpoint(std::vector<char>::const_iterator& it) {
+  return deserializeVerbsEndpoint<Ib>(it);
+}
+
+std::shared_ptr<RdmaEndpoint> deserializeMrcEndpoint(std::vector<char>::const_iterator& it) {
+  return deserializeVerbsEndpoint<Mrc>(it);
 }
 
 std::shared_ptr<RdmaMemory> deserializeIbMemory(std::vector<char>::const_iterator& it) {
@@ -971,9 +1287,10 @@ std::shared_ptr<RdmaMemory> deserializeIbMemory(std::vector<char>::const_iterato
   return std::make_shared<IbMemory>(info);
 }
 
-// IBConnection
+// Shared host connection protocol for IB and native MRC.
 
-void IBConnection::recvThreadFunc() {
+template <typename Backend>
+void VerbsConnection<Backend>::recvThreadFunc() {
   // Set the CUDA device context for this thread
   if (localGpuDeviceId_ >= 0) {
     cudaError_t err = cudaSetDevice(localGpuDeviceId_);
@@ -1046,8 +1363,9 @@ void IBConnection::recvThreadFunc() {
   }
 }
 
-IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& localEndpoint,
-                           const Endpoint& remoteEndpoint)
+template <typename Backend>
+VerbsConnection<Backend>::VerbsConnection(std::shared_ptr<Context> context, const Endpoint& localEndpoint,
+                                          const Endpoint& remoteEndpoint)
     : BaseConnection(context, localEndpoint),
       transport_(localEndpoint.transport()),
       remoteTransport_(remoteEndpoint.transport()),
@@ -1058,15 +1376,20 @@ IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& loc
       recvThreadError_(false),
       localGpuDeviceId_(localEndpoint.device().id),
       signalAddr_(0) {
-  const auto& localIbEndpoint = getIbEndpoint(*getImpl(localEndpoint).rdmaEndpoint_);
-  const auto& remoteIbEndpoint = getIbEndpoint(*getImpl(remoteEndpoint).rdmaEndpoint_);
+  const auto& localIbEndpoint = getVerbsEndpoint<Backend>(*getImpl(localEndpoint).rdmaEndpoint_);
+  const auto& remoteIbEndpoint = getVerbsEndpoint<Backend>(*getImpl(remoteEndpoint).rdmaEndpoint_);
   ibNoAtomic_ = localIbEndpoint.noAtomic();
+  if constexpr (Backend::nativeMrc) {
+    if (!ibNoAtomic_ || !remoteIbEndpoint.noAtomic()) {
+      THROW(CONN, Error, ErrorCode::InvalidUsage, "Native MRC requires write-with-immediate signaling on both peers");
+    }
+  }
   qp_ = localIbEndpoint.qp();
   qp_.lock()->rtr(remoteIbEndpoint.info());
   qp_.lock()->rts();
   atomicSrcMem_ = context->registerMemory(atomicSrc_.get(), sizeof(uint64_t), transport_);
   validateTransport(atomicSrcMem_, transport_);
-  atomicSrcMr_ = getIbMemory(getImpl(atomicSrcMem_).getTransportInfo(transport_)).mr();
+  atomicSrcMr_ = getVerbsMemory(getImpl(atomicSrcMem_).getTransportInfo(transport_)).mr();
 
   if (ibNoAtomic_) {
 #if defined(MSCCLPP_USE_CUDA)
@@ -1111,21 +1434,35 @@ IBConnection::IBConnection(std::shared_ptr<Context> context, const Endpoint& loc
     // The recv thread is started later in startSignalForwarding() when the semaphore
     // provides the signal forwarding destination. This ensures the thread lifetime is
     // bounded by the GdrMap lifetime (created before start, destroyed after stop).
-    INFO(CONN, "IBConnection via ", getIBDeviceName(transport_), " created with signal forwarding (HostNoAtomic) mode");
+    INFO(CONN, Backend::name, "Connection via ", localIbEndpoint.context().getDevName(),
+         " created with signal forwarding (HostNoAtomic) mode");
   } else {
-    INFO(CONN, "IBConnection via ", getIBDeviceName(transport_), " created with atomic mode");
+    INFO(CONN, Backend::name, "Connection via ", localIbEndpoint.context().getDevName(), " created with atomic mode");
   }
 }
 
-IBConnection::~IBConnection() { stopSignalForwarding(); }
+template <typename Backend>
+VerbsConnection<Backend>::~VerbsConnection() {
+  stopSignalForwarding();
+}
 
-Transport IBConnection::transport() const { return transport_; }
+template <typename Backend>
+Transport VerbsConnection<Backend>::transport() const {
+  return transport_;
+}
 
-Transport IBConnection::remoteTransport() const { return remoteTransport_; }
+template <typename Backend>
+Transport VerbsConnection<Backend>::remoteTransport() const {
+  return remoteTransport_;
+}
 
-bool IBConnection::isSignalForwarding() const { return ibNoAtomic_; }
+template <typename Backend>
+bool VerbsConnection<Backend>::isSignalForwarding() const {
+  return ibNoAtomic_;
+}
 
-void IBConnection::startSignalForwarding(std::shared_ptr<uint64_t> mem) {
+template <typename Backend>
+void VerbsConnection<Backend>::startSignalForwarding(std::shared_ptr<uint64_t> mem) {
   // Set up the forwarding destination and GdrMap, then start the recv thread.
   // Order: set address → create GdrMap → start thread.
   signalAddr_ = reinterpret_cast<uint64_t>(mem.get());
@@ -1139,7 +1476,8 @@ void IBConnection::startSignalForwarding(std::shared_ptr<uint64_t> mem) {
   INFO(CONN, "IBConnection startSignalForwarding: ", (void*)signalAddr_);
 }
 
-void IBConnection::stopSignalForwarding() {
+template <typename Backend>
+void VerbsConnection<Backend>::stopSignalForwarding() {
   // Stop the recv thread, then tear down GdrMap and address.
   // Order: stop thread → destroy GdrMap → clear address.
   if (ibNoAtomic_) {
@@ -1155,8 +1493,9 @@ void IBConnection::stopSignalForwarding() {
   INFO(CONN, "IBConnection stopSignalForwarding");
 }
 
-void IBConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMemory src, uint64_t srcOffset,
-                         uint64_t size) {
+template <typename Backend>
+void VerbsConnection<Backend>::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMemory src, uint64_t srcOffset,
+                                     uint64_t size) {
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_CONN_IB_WRITE_ENTRY)
   NpKit::CollectCpuEvent(NPKIT_EVENT_CONN_IB_WRITE_ENTRY, uint32_t(size), 0, *NpKit::GetCpuTimestamp(), 0);
 #endif
@@ -1164,11 +1503,11 @@ void IBConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMem
   validateTransport(dst, remoteTransport(), dstOffset, size);
   validateTransport(src, transport(), srcOffset, size);
 
-  const auto& dstMemory = getIbMemory(getImpl(dst).getTransportInfo(remoteTransport()));
+  const auto& dstMemory = getVerbsMemory(getImpl(dst).getTransportInfo(remoteTransport()));
   if (dstMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
-  const auto& srcMemory = getIbMemory(getImpl(src).getTransportInfo(transport()));
+  const auto& srcMemory = getVerbsMemory(getImpl(src).getTransportInfo(transport()));
   if (!srcMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "src is remote, which is not supported");
   }
@@ -1188,13 +1527,15 @@ void IBConnection::write(RegisteredMemory dst, uint64_t dstOffset, RegisteredMem
 #endif
 }
 
-void IBConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src, uint64_t newValue) {
+template <typename Backend>
+void VerbsConnection<Backend>::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint64_t* src,
+                                             uint64_t newValue) {
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_CONN_IB_UPDATE_AND_SYNC_ENTRY)
   NpKit::CollectCpuEvent(NPKIT_EVENT_CONN_IB_UPDATE_AND_SYNC_ENTRY, 0, 0, *NpKit::GetCpuTimestamp(), 0);
 #endif
 
   validateTransport(dst, remoteTransport());
-  const auto& dstMemory = getIbMemory(getImpl(dst).getTransportInfo(remoteTransport()));
+  const auto& dstMemory = getVerbsMemory(getImpl(dst).getTransportInfo(remoteTransport()));
   if (dstMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
@@ -1236,7 +1577,8 @@ void IBConnection::updateAndSync(RegisteredMemory dst, uint64_t dstOffset, uint6
 #endif
 }
 
-void IBConnection::flush(int64_t timeoutUsec) {
+template <typename Backend>
+void VerbsConnection<Backend>::flush(int64_t timeoutUsec) {
 #if defined(ENABLE_NPKIT) && defined(ENABLE_NPKIT_EVENT_CONN_IB_FLUSH_ENTRY)
   NpKit::CollectCpuEvent(NPKIT_EVENT_CONN_IB_FLUSH_ENTRY, 0, 0, *NpKit::GetCpuTimestamp(), 0);
 #endif
@@ -1272,10 +1614,11 @@ void IBConnection::flush(int64_t timeoutUsec) {
 #endif
 }
 
-void IBConnection::accumulate(RegisteredMemory dst, uint64_t dstOffset, int64_t value) {
+template <typename Backend>
+void VerbsConnection<Backend>::accumulate(RegisteredMemory dst, uint64_t dstOffset, int64_t value) {
   validateTransport(dst, remoteTransport());
   validateAccumulateBounds(dst, dstOffset);
-  const auto& dstMemory = getIbMemory(getImpl(dst).getTransportInfo(remoteTransport()));
+  const auto& dstMemory = getVerbsMemory(getImpl(dst).getTransportInfo(remoteTransport()));
   if (dstMemory.isLocal()) {
     THROW(CONN, Error, ErrorCode::InvalidUsage, "dst is local, which is not supported");
   }
@@ -1283,7 +1626,7 @@ void IBConnection::accumulate(RegisteredMemory dst, uint64_t dstOffset, int64_t 
   validateAccumulateAlignment(static_cast<uintptr_t>(dstMrInfo.addr), dstOffset);
 
   if (ibNoAtomic_) {
-    THROW(CONN, Error, ErrorCode::InvalidUsage, "accumulate is not supported in IB no-atomic mode");
+    THROW(CONN, Error, ErrorCode::InvalidUsage, "accumulate is not supported in ", Backend::name, " no-atomic mode");
   }
 
   qp_.lock()->stageSendAtomicAdd(atomicSrcMr_, dstMrInfo, /*wrId=*/0, dstOffset, static_cast<uint64_t>(value),
@@ -1292,12 +1635,14 @@ void IBConnection::accumulate(RegisteredMemory dst, uint64_t dstOffset, int64_t 
   INFO(CONN, "IBConnection accumulate: dst ", (uint8_t*)dstMrInfo.addr + dstOffset, ", value ", value);
 }
 
-void IBConnection::requestFlush() {
+template <typename Backend>
+void VerbsConnection<Backend>::requestFlush() {
   // No-op: IB sends were already posted by prior conn.write() calls in handleTrigger.
   // progressFlush() drives completion by polling the send CQ.
 }
 
-bool IBConnection::progressFlush() {
+template <typename Backend>
+bool VerbsConnection<Backend>::progressFlush() {
   if (recvThreadError_.load(std::memory_order_acquire)) {
     THROW(CONN, Error, ErrorCode::SystemError, "IBConnection recv thread failed: ", recvThreadErrorMsg_);
   }
@@ -1320,5 +1665,14 @@ bool IBConnection::progressFlush() {
   }
   return qp->getNumSendCqItems() == 0;
 }
+
+template class VerbsQp<Ib>;
+template class VerbsQp<Mrc>;
+template class VerbsCtx<Ib>;
+template class VerbsCtx<Mrc>;
+template class VerbsEndpoint<Ib>;
+template class VerbsEndpoint<Mrc>;
+template class VerbsProvider<Ib>;
+template class VerbsProvider<Mrc>;
 
 }  // namespace mscclpp

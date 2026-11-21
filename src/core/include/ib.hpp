@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 
 #ifndef MSCCLPP_IB_HPP_
 #define MSCCLPP_IB_HPP_
@@ -8,6 +8,7 @@
 #include <memory>
 #include <mscclpp/core.hpp>
 #include <string>
+#include <string_view>
 
 #include "rdma_provider.hpp"
 
@@ -21,12 +22,76 @@ struct ibv_wc;
 struct ibv_send_wr;
 struct ibv_recv_wr;
 struct ibv_sge;
+struct ibv_qp_attr;
+struct ibv_qp_cap;
+struct mrc_context;
+struct mrc_qp;
+struct mrc_cq;
+struct mrc_qp_hint;
 
 namespace mscclpp {
 
 struct TransportInfo;
 struct GpuNetIoDevice;
 class GpuNetIoQp;
+
+template <bool Native>
+struct VerbsLib;
+
+// Only the context/CQ/QP API differs. Both backends use native verbs PDs, MRs,
+// work requests and completions. MRC must not open a context through the shim.
+struct Ib {
+  struct Hint {};
+  using Context = ibv_context;
+  using Qp = ibv_qp;
+  using Cq = ibv_cq;
+  using Verbs = VerbsLib<false>;
+  static constexpr bool nativeMrc = false;
+  static constexpr std::string_view name = "IB";
+  static constexpr Transport firstTransport = Transport::IB0;
+
+  static Context* createContext(ibv_context* context);
+  static void destroyContext(Context* context);
+  static Cq* createCq(Context* context, int size);
+  static void destroyCq(Cq* cq);
+  static Hint* createHint(Context* context);
+  static int destroyHint(Hint* hint);
+  static Qp* createQp(Context* context, ibv_pd* pd, Cq* sendCq, Cq* recvCq, const ibv_qp_cap& cap);
+  static int destroyQp(Qp* qp);
+  static int getQpn(Qp* qp, uint32_t* qpn);
+  static int modifyQp(Qp* qp, ibv_qp_attr* attr, int mask, Hint* hint = nullptr);
+  static int postSend(Qp* qp, ibv_send_wr* wr, ibv_send_wr** badWr);
+  static int postRecv(Qp* qp, ibv_recv_wr* wr, ibv_recv_wr** badWr);
+  static int pollCq(Cq* cq, int count, ibv_wc* wc);
+};
+
+struct Mrc {
+  using Hint = mrc_qp_hint;
+  using Context = mrc_context;
+  using Qp = mrc_qp;
+  using Cq = mrc_cq;
+  using Verbs = VerbsLib<true>;
+  static constexpr bool nativeMrc = true;
+  static constexpr std::string_view name = "MRC";
+  static constexpr Transport firstTransport = Transport::MRC0;
+
+  static Context* createContext(ibv_context* context);
+  static void destroyContext(Context* context);
+  static Cq* createCq(Context* context, int size);
+  static void destroyCq(Cq* cq);
+  static Hint* createHint(Context* context);
+  static int destroyHint(Hint* hint);
+  static Qp* createQp(Context* context, ibv_pd* pd, Cq* sendCq, Cq* recvCq, const ibv_qp_cap& cap);
+  static int destroyQp(Qp* qp);
+  static int getQpn(Qp* qp, uint32_t* qpn);
+  static int modifyQp(Qp* qp, ibv_qp_attr* attr, int mask, Hint* hint = nullptr);
+  static int postSend(Qp* qp, ibv_send_wr* wr, ibv_send_wr** badWr);
+  static int postRecv(Qp* qp, ibv_recv_wr* wr, ibv_recv_wr** badWr);
+  static int pollCq(Cq* cq, int count, ibv_wc* wc);
+};
+
+template <typename Backend>
+class VerbsCtx;
 
 struct IbMrInfo {
   uint64_t addr;
@@ -42,13 +107,15 @@ class IbMr {
   uint32_t getLkey() const;
 
  private:
-  IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect);
+  IbMr(ibv_pd* pd, void* buff, std::size_t size, bool isDataDirect, bool native);
 
   ibv_mr* mr_;
   void* buff_;
   std::size_t size_;
+  bool native_;
 
-  friend class IbCtx;
+  template <typename Backend>
+  friend class VerbsCtx;
 };
 
 // QP info to be shared with the remote peer
@@ -66,9 +133,10 @@ enum class WsStatus {
   Success,
 };
 
-class IbQp {
+template <typename Backend>
+class VerbsQp {
  public:
-  ~IbQp();
+  ~VerbsQp();
 
   void rtr(const IbQpInfo& info);
   void rts();
@@ -96,6 +164,8 @@ class IbQp {
   unsigned int getRecvWcImmData(int idx) const;
 
  private:
+  using Verbs = typename Backend::Verbs;
+
   struct SendWrInfo {
     ibv_send_wr* wr;
     ibv_sge* sge;
@@ -106,8 +176,9 @@ class IbQp {
     ibv_sge* sge;
   };
 
-  IbQp(ibv_context* ctx, ibv_pd* pd, int portNum, int gidIndex, int maxSendCqSize, int maxSendCqPollNum, int maxSendWr,
-       int maxRecvWr, int maxWrPerSend, bool noAtomic);
+  VerbsQp(typename Backend::Context* ctx, ibv_context* verbsCtx, ibv_pd* pd, int portNum, int gidIndex,
+          int maxSendCqSize, int maxSendCqPollNum, int maxSendWr, int maxRecvWr, int maxWrPerSend, bool noAtomic);
+  void reset();
   SendWrInfo getNewSendWrInfo();
   RecvWrInfo getNewRecvWrInfo();
 
@@ -116,9 +187,10 @@ class IbQp {
 
   IbQpInfo info_;
 
-  ibv_qp* qp_;
-  ibv_cq* sendCq_;
-  ibv_cq* recvCq_;
+  typename Backend::Qp* qp_;
+  typename Backend::Hint* hint_;
+  typename Backend::Cq* sendCq_;
+  typename Backend::Cq* recvCq_;
   std::shared_ptr<std::vector<ibv_wc>> sendWcs_;
   std::shared_ptr<std::vector<ibv_wc>> recvWcs_;
   std::shared_ptr<std::vector<ibv_send_wr>> sendWrs_;
@@ -137,17 +209,18 @@ class IbQp {
   const int maxRecvWr_;
   const bool noAtomic_;
 
-  friend class IbCtx;
+  friend class VerbsCtx<Backend>;
 };
 
-class IbCtx {
+template <typename Backend>
+class VerbsCtx {
  public:
 #if defined(USE_IBVERBS)
-  IbCtx(const std::string& devName);
-  ~IbCtx();
+  VerbsCtx(const std::string& devName);
+  ~VerbsCtx();
 
-  std::shared_ptr<IbQp> createQp(int port, int gidIndex, int maxSendCqSize, int maxSendCqPollNum, int maxSendWr,
-                                 int maxRecvWr, int maxWrPerSend, bool noAtomic);
+  std::shared_ptr<VerbsQp<Backend>> createQp(int port, int gidIndex, int maxSendCqSize, int maxSendCqPollNum,
+                                             int maxSendWr, int maxRecvWr, int maxWrPerSend, bool noAtomic);
   std::unique_ptr<const IbMr> registerMr(void* buff, std::size_t size);
   bool supportsRdmaAtomics() const;
   bool isMlx5() const;
@@ -162,10 +235,10 @@ class IbCtx {
   /// DOCA GPUNetIO handles opened on this device's protection domain, created on first use. Requires GPUNetIO.
   GpuNetIoDevice& gpuNetIoDevice();
 #else
-  IbCtx([[maybe_unused]] const std::string& devName) {}
-  ~IbCtx() {}
+  VerbsCtx(const std::string& devName) : devName_(devName) {}
+  ~VerbsCtx() {}
 
-  std::shared_ptr<IbQp> createQp(int, int, int, int, int, int, int, bool) { return nullptr; }
+  std::shared_ptr<VerbsQp<Backend>> createQp(int, int, int, int, int, int, int, bool) { return nullptr; }
   std::unique_ptr<const IbMr> registerMr([[maybe_unused]] void* buff, [[maybe_unused]] std::size_t size) {
     return nullptr;
   }
@@ -180,11 +253,14 @@ class IbCtx {
   const std::string& getDevName() const { return devName_; };
 
  private:
+  using Verbs = typename Backend::Verbs;
+  void reset();
   bool isPortUsable(int port, int gidIndex) const;
   int getAnyUsablePort(int gidIndex) const;
 
   const std::string devName_;
-  ibv_context* ctx_;
+  ibv_context* verbsCtx_;
+  typename Backend::Context* ctx_;
   ibv_pd* pd_;
   bool supportsRdmaAtomics_;
   bool isMlx5_;
@@ -195,6 +271,17 @@ class IbCtx {
 #endif
 };
 
+using IbCtx = VerbsCtx<Ib>;
+using MrcCtx = VerbsCtx<Mrc>;
+using IbQp = VerbsQp<Ib>;
+using MrcQp = VerbsQp<Mrc>;
+
+#if defined(USE_IBVERBS)
+template <>
+GpuNetIoDevice& VerbsCtx<Ib>::gpuNetIoDevice();
+#endif
+
+// Registration and imported MR metadata are identical for native IB and MRC.
 class IbMemory final : public RdmaMemory {
  public:
   IbMemory(std::shared_ptr<RdmaProvider> provider, std::unique_ptr<const IbMr> mr);
@@ -209,41 +296,49 @@ class IbMemory final : public RdmaMemory {
   IbMrInfo info_;
 };
 
-class IbEndpoint final : public RdmaEndpoint {
+template <typename Backend>
+class VerbsEndpoint final : public RdmaEndpoint {
  public:
-  IbEndpoint(std::shared_ptr<RdmaProvider> provider, IbCtx& context, EndpointConfig& config);
-  IbEndpoint(const IbQpInfo& info, bool noAtomic);
+  VerbsEndpoint(std::shared_ptr<RdmaProvider> provider, VerbsCtx<Backend>& context, EndpointConfig& config);
+  VerbsEndpoint(const IbQpInfo& info, bool noAtomic);
   bool isLocal() const override { return qp_ != nullptr || gpuNetIoQp_ != nullptr; }
   void serialize(std::vector<char>& data) const override;
   std::shared_ptr<BaseConnection> createConnection(std::shared_ptr<Context> context, const Endpoint& local,
                                                    const Endpoint& remote) const override;
-  const std::shared_ptr<IbQp>& qp() const { return qp_; }
+  const std::shared_ptr<VerbsQp<Backend>>& qp() const { return qp_; }
   const std::shared_ptr<GpuNetIoQp>& gpuNetIoQp() const { return gpuNetIoQp_; }
   const IbQpInfo& info() const { return info_; }
   bool noAtomic() const { return noAtomic_; }
-  const IbCtx& context() const { return *context_; }
+  const VerbsCtx<Backend>& context() const { return *context_; }
 
  private:
-  IbCtx* context_ = nullptr;
-  std::shared_ptr<IbQp> qp_;
+  VerbsCtx<Backend>* context_ = nullptr;
+  std::shared_ptr<VerbsQp<Backend>> qp_;
   std::shared_ptr<GpuNetIoQp> gpuNetIoQp_;
   IbQpInfo info_;
   bool noAtomic_;
 };
 
-class IbProvider final : public RdmaProvider {
+template <typename Backend>
+class VerbsProvider final : public RdmaProvider {
  public:
-  explicit IbProvider(Transport transport);
+  explicit VerbsProvider(Transport transport);
   std::shared_ptr<RdmaEndpoint> createEndpoint(EndpointConfig& config) override;
   std::shared_ptr<RdmaMemory> registerMemory(void* data, size_t size) override;
 
  private:
-  IbCtx context_;
+  VerbsCtx<Backend> context_;
 };
+
+using IbEndpoint = VerbsEndpoint<Ib>;
+using MrcEndpoint = VerbsEndpoint<Mrc>;
+using IbProvider = VerbsProvider<Ib>;
+using MrcProvider = VerbsProvider<Mrc>;
 
 const IbEndpoint& getIbEndpoint(const RdmaEndpoint& endpoint);
 const IbMemory& getIbMemory(const TransportInfo& info);
 std::shared_ptr<RdmaEndpoint> deserializeIbEndpoint(std::vector<char>::const_iterator& it);
+std::shared_ptr<RdmaEndpoint> deserializeMrcEndpoint(std::vector<char>::const_iterator& it);
 std::shared_ptr<RdmaMemory> deserializeIbMemory(std::vector<char>::const_iterator& it);
 
 }  // namespace mscclpp

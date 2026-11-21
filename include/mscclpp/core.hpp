@@ -220,11 +220,19 @@ enum class Transport {
   IB6,            // InfiniBand device 6 transport type.
   IB7,            // InfiniBand device 7 transport type.
   Ethernet,       // Ethernet transport type.
+  MRC0,           ///< Native MRC device 0; host write/write-with-immediate only.
+  MRC1,           ///< Native MRC device 1; uses the same HCA index mapping as IB1.
+  MRC2,           ///< Native MRC device 2; uses the same HCA index mapping as IB2.
+  MRC3,           ///< Native MRC device 3; uses the same HCA index mapping as IB3.
+  MRC4,           ///< Native MRC device 4; uses the same HCA index mapping as IB4.
+  MRC5,           ///< Native MRC device 5; uses the same HCA index mapping as IB5.
+  MRC6,           ///< Native MRC device 6; uses the same HCA index mapping as IB6.
+  MRC7,           ///< Native MRC device 7; uses the same HCA index mapping as IB7.
   NumTransports,  // The number of transports.
 };
 
 namespace detail {
-const size_t TransportFlagsSize = 11;
+const size_t TransportFlagsSize = 19;
 static_assert(TransportFlagsSize == static_cast<size_t>(Transport::NumTransports),
               "TransportFlagsSize must match the number of transports");
 /// Bitset for storing transport flags.
@@ -384,9 +392,9 @@ struct Device {
 
 /// Configuration for creating communication endpoints.
 struct EndpointConfig {
-  /// InfiniBand-specific configuration options that control queue pair behavior and performance characteristics.
-  /// These settings are only used when the transport is an InfiniBand type (IB0-IB7); they are ignored for other
-  /// transports.
+  /// Verbs queue pair configuration, shared by InfiniBand (IB0-IB7) and native MRC (MRC0-MRC7).
+  /// Native MRC always uses host write-with-immediate signaling, even for Default or Host mode;
+  /// Device mode and network atomics are unsupported. Other transports ignore these settings.
   struct Ib {
     /// IB mode for signaling, used to select between different implementations.
     enum class Mode {
@@ -401,10 +409,10 @@ struct EndpointConfig {
     static constexpr int DefaultMaxCqSize = 1024;
     static constexpr int DefaultMaxCqPollNum = 256;
     static constexpr int DefaultMaxSendWr = 8192;
-    static constexpr int DefaultMaxRecvWr = 16;
+    static constexpr int DefaultMaxRecvWr = 1025;
     static constexpr int DefaultMaxWrPerSend = 64;
 
-    /// Device index. Currently ignored; use transport type (IB0-IB7) to select device.
+    /// Device index. Currently ignored; use transport type (IB0-IB7 or MRC0-MRC7) to select device.
     int deviceIndex;
     /// Port number.
     int port;
@@ -447,13 +455,13 @@ struct EndpointConfig {
           mode(mode) {}
   };
 
-  /// Communication transport type (e.g., CudaIpc, IB0-IB7, Ethernet).
+  /// Communication transport type (e.g., CudaIpc, IB0-IB7, MRC0-MRC7, Ethernet).
   Transport transport;
   /// Target device for the endpoint (GPU or CPU with optional device ID).
   Device device;
   /// Maximum number of write requests that can be queued (-1 for default).
   int maxWriteQueueSize;
-  /// InfiniBand-specific options (used only for Transport::IBx).
+  /// Verbs options (used for Transport::IBx and Transport::MRCx).
   Ib ib;
 
   /// Constructs endpoint configuration with specified transport, device, and optional settings.
@@ -985,6 +993,10 @@ extern const TransportFlags NoTransports;
 
 /// A constant TransportFlags object representing all InfiniBand transports.
 extern const TransportFlags AllIBTransports;
+
+/// A constant TransportFlags object representing all native MRC transports.
+/// Native MRC requires MSCCLPP_USE_MRC and does not interoperate with IB endpoints.
+extern const TransportFlags AllMRCTransports;
 
 /// A constant TransportFlags object representing all transports.
 extern const TransportFlags AllTransports;

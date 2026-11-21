@@ -63,7 +63,9 @@ if(MSCCLPP_NPKIT_FLAGS)
 endif()
 
 if(MSCCLPP_USE_MRC)
-	target_compile_definitions(mscclpp_obj PRIVATE MSCCLPP_USE_MRC)
+    target_include_directories(mscclpp_obj SYSTEM PRIVATE ${MRC_INCLUDE_DIR})
+    target_link_libraries(mscclpp_obj PRIVATE ${MRC_LIBRARY})
+    target_compile_definitions(mscclpp_obj PRIVATE MSCCLPP_USE_MRC)
 endif()
 
 # libmscclpp

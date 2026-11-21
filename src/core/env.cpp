@@ -1,5 +1,5 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 
 #include <cstdlib>
 #include <type_traits>
@@ -10,6 +10,17 @@
 // clang-format on
 
 #include "logger.hpp"
+#include "mrc_hints.hpp"
+
+static int64_t readMrcHintRate(const char* name) {
+  const char* value = std::getenv(name);
+  return value ? mscclpp::detail::parseMrcHintInteger(name, value) : 0;
+}
+
+static bool readMrcHintEnable() {
+  const char* value = std::getenv("MSCCLPP_MRC_QP_HINT_ENABLE");
+  return value ? mscclpp::detail::parseMrcHintEnable(value) : false;
+}
 
 template <typename T>
 T readEnv(const std::string& envName, const T& defaultValue) {
@@ -67,7 +78,11 @@ Env::Env()
       ncclSymmetricMemory(readEnv<bool>("MSCCLPP_NCCL_SYMMETRIC_MEMORY", false)),
       forceDisableNvls(readEnv<bool>("MSCCLPP_FORCE_DISABLE_NVLS", false)),
       forceDisableGdr(readEnv<bool>("MSCCLPP_FORCE_DISABLE_GDR", false)),
-      ibGidIndex(readEnv<int>("MSCCLPP_IB_GID_INDEX", 0)) {}
+      ibGidIndex(readEnv<int>("MSCCLPP_IB_GID_INDEX", 0)),
+      mrcQpHintEnable(readMrcHintEnable()),
+      mrcCcInitRate(mrcQpHintEnable ? readMrcHintRate("MSCCLPP_MRC_CC_INIT_RATE") : 0),
+      mrcCcMinRate(mrcQpHintEnable ? readMrcHintRate("MSCCLPP_MRC_CC_MIN_RATE") : 0),
+      mrcCcMaxRate(mrcQpHintEnable ? readMrcHintRate("MSCCLPP_MRC_CC_MAX_RATE") : 0) {}
 
 std::shared_ptr<Env> env() {
   static std::shared_ptr<Env> globalEnv = std::shared_ptr<Env>(new Env());
@@ -97,6 +112,12 @@ std::shared_ptr<Env> env() {
     logEnv("MSCCLPP_FORCE_DISABLE_NVLS", globalEnv->forceDisableNvls);
     logEnv("MSCCLPP_FORCE_DISABLE_GDR", globalEnv->forceDisableGdr);
     logEnv("MSCCLPP_IB_GID_INDEX", globalEnv->ibGidIndex);
+    logEnv("MSCCLPP_MRC_QP_HINT_ENABLE", globalEnv->mrcQpHintEnable);
+    if (globalEnv->mrcQpHintEnable) {
+      logEnv("MSCCLPP_MRC_CC_INIT_RATE", globalEnv->mrcCcInitRate);
+      logEnv("MSCCLPP_MRC_CC_MIN_RATE", globalEnv->mrcCcMinRate);
+      logEnv("MSCCLPP_MRC_CC_MAX_RATE", globalEnv->mrcCcMaxRate);
+    }
   }
   return globalEnv;
 }

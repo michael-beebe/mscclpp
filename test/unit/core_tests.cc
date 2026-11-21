@@ -4,9 +4,11 @@
 #include <endian.h>
 
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <mscclpp/core.hpp>
 #include <sstream>
+#include <type_traits>
 
 #include "../framework.hpp"
 #include "connection.hpp"
@@ -75,6 +77,118 @@ TEST(TransportFlagsTest, OutputStream) {
   EXPECT_EQ(toString(mscclpp::Transport::CudaIpc), std::string("{IPC}"));
   EXPECT_EQ(toString(mscclpp::Transport::CudaIpc | mscclpp::Transport::IB0 | mscclpp::Transport::Ethernet),
             std::string("{IPC, IB0, ETH}"));
+  EXPECT_EQ(toString(mscclpp::Transport::MRC0 | mscclpp::Transport::MRC7), std::string("{MRC0, MRC7}"));
+  EXPECT_EQ(mscclpp::AllMRCTransports.count(), size_t{8});
+}
+
+TEST(RdmaProviderTest, NativeMrcClassificationAndWireLayout) {
+  using namespace mscclpp;
+  static_assert(static_cast<int>(Transport::IB0) == 2 && static_cast<int>(Transport::Ethernet) == 10);
+  static_assert(sizeof(detail::TransportFlagsBase) == sizeof(std::bitset<11>));
+  static_assert(std::is_same_v<IbCtx, VerbsCtx<Ib>> && std::is_same_v<MrcCtx, VerbsCtx<Mrc>>);
+  static_assert(std::is_same_v<IbProvider, VerbsProvider<Ib>> && std::is_same_v<MrcProvider, VerbsProvider<Mrc>>);
+  EXPECT_TRUE(getRdmaTransports().has(Transport::IB0));
+  EXPECT_TRUE(getRdmaTransports().has(Transport::MRC7));
+  EXPECT_TRUE(areRdmaTransportsCompatible(Transport::MRC0, Transport::MRC7));
+  EXPECT_FALSE(areRdmaTransportsCompatible(Transport::IB0, Transport::MRC0));
+  EXPECT_FALSE(areRdmaTransportsCompatible(Transport::MRC0, Transport::IB7));
+  EXPECT_FALSE(areRdmaTransportsCompatible(Transport::CudaIpc, Transport::MRC0));
+}
+
+TEST(RdmaProviderTest, ImportedNativeMrcMetadataPreservesWireBytes) {
+  using namespace mscclpp;
+  IbQpInfo qp;
+  std::memset(&qp, 0xa5, sizeof(qp));
+  qp.qpn = 123;
+  qp.isGrh = true;
+  EndpointConfig config(Transport::MRC7, DeviceType::CPU);
+  config.ib.mode = EndpointConfig::Ib::Mode::HostNoAtomic;
+  uint64_t hostHash = getHostHash() ^ 1;
+  uint64_t pidHash = getPidHash();
+  std::vector<char> endpointBytes;
+  detail::serialize(endpointBytes, config);
+  detail::serialize(endpointBytes, hostHash);
+  detail::serialize(endpointBytes, pidHash);
+  detail::serialize(endpointBytes, qp);
+  detail::serialize(endpointBytes, true);
+  auto endpoint = Endpoint::deserialize(endpointBytes);
+  EXPECT_TRUE(endpoint.serialize() == endpointBytes);
+  EXPECT_FALSE(RdmaTestAccess::getImpl(endpoint).rdmaEndpoint_->isLocal());
+  try {
+    getIbEndpoint(*RdmaTestAccess::getImpl(endpoint).rdmaEndpoint_);
+    FAIL() << "Native MRC metadata must not be treated as an IB endpoint";
+  } catch (const Error& error) {
+    EXPECT_TRUE(error.getErrorCode() == ErrorCode::InvalidUsage);
+  }
+
+  uint64_t buffer = 0;
+  void* ptr = &buffer;
+  size_t size = sizeof(buffer);
+  TransportFlags transports = Transport::MRC7 | Transport::IB1;
+  int8_t count = 3;
+  std::vector<char> memoryBytes;
+  detail::serialize(memoryBytes, ptr);
+  detail::serialize(memoryBytes, size);
+  detail::serialize(memoryBytes, hostHash);
+  detail::serialize(memoryBytes, pidHash);
+  detail::serialize(memoryBytes, transports);
+  detail::serialize(memoryBytes, count);
+  for (auto transport : {Transport::MRC7, Transport::IB1, Transport::MRC7}) {
+    IbMrInfo mr;
+    std::memset(&mr, 0x5a, sizeof(mr));
+    mr.addr = 0x1000;
+    mr.rkey = 53;
+    detail::serialize(memoryBytes, transport);
+    detail::serialize(memoryBytes, mr);
+  }
+  auto memory = RegisteredMemory::deserialize(memoryBytes);
+  EXPECT_TRUE(memory.serialize() == memoryBytes);
+  EXPECT_EQ(memory.data(), nullptr);
+}
+
+TEST(RdmaProviderTest, NativeMrcEndpointRoutingRejectsIbFamily) {
+  using namespace mscclpp;
+  auto import = [](Transport transport) {
+    EndpointConfig config(transport, DeviceType::CPU);
+    uint64_t hash = 1;
+    std::vector<char> bytes;
+    detail::serialize(bytes, config);
+    detail::serialize(bytes, hash);
+    detail::serialize(bytes, hash);
+    detail::serialize(bytes, IbQpInfo{});
+    detail::serialize(bytes, true);
+    return Endpoint::deserialize(bytes);
+  };
+  auto context = Context::create();
+  for (auto pair : {std::pair{Transport::MRC0, Transport::MRC7}, std::pair{Transport::MRC0, Transport::IB0},
+                    std::pair{Transport::IB0, Transport::MRC0}}) {
+    try {
+      context->connect(import(pair.first), import(pair.second));
+      FAIL() << "Imported endpoints cannot construct a local connection";
+    } catch (const Error& error) {
+      EXPECT_TRUE(error.getErrorCode() == ErrorCode::InvalidUsage);
+      const char* expected = AllMRCTransports.has(pair.first) && AllMRCTransports.has(pair.second)
+                                 ? "Cannot create a connection from a remote MRC endpoint"
+                                 : "Transport mismatch";
+      EXPECT_TRUE(std::string(error.what()).find(expected) != std::string::npos);
+    }
+  }
+}
+
+TEST(RdmaProviderTest, NativeMrcUnavailableIsExplicit) {
+#if !defined(MSCCLPP_USE_MRC)
+  using namespace mscclpp;
+  auto context = Context::create();
+  try {
+    context->createEndpoint({Transport::MRC0, DeviceType::CPU});
+    FAIL() << "Disabled native MRC must not fall back to IB";
+  } catch (const Error& error) {
+    EXPECT_TRUE(error.getErrorCode() == ErrorCode::InvalidUsage);
+    EXPECT_TRUE(std::string(error.what()).find("Native MRC support is not enabled") != std::string::npos);
+  }
+#else
+  SKIP_TEST() << "Native MRC support is enabled";
+#endif
 }
 
 TEST(LocalCommunicatorTest, RegisterMemory) {
@@ -218,22 +332,22 @@ TEST(RdmaProviderTest, RegisteredMemoryKeepsProviderMetadataOpaque) {
   std::vector<std::weak_ptr<RdmaProvider>> providers;
   auto context = Context::create();
   // These test doubles are opaque to generic code and are never used for IB I/O.
-  for (auto transport : {Transport::IB7, Transport::IB1, Transport::IB0}) {
+  for (auto transport : {Transport::MRC7, Transport::IB7, Transport::IB1, Transport::IB0}) {
     auto provider = std::make_shared<OpaqueRdmaProvider>(transport, calls, ptr, size);
     providers.push_back(provider);
     RdmaTestAccess::getImpl(*context).rdmaProviders_.emplace(transport, std::move(provider));
   }
   TransportFlags transports =
-      Transport::IB7 | Transport::IB0 | Transport::IB1 | Transport::Ethernet | Transport::Unknown;
+      Transport::MRC7 | Transport::IB7 | Transport::IB0 | Transport::IB1 | Transport::Ethernet | Transport::Unknown;
   auto memory = context->registerMemory(ptr, size, transports);
-  EXPECT_TRUE(calls == (std::vector<Transport>{Transport::IB0, Transport::IB1, Transport::IB7}));
+  EXPECT_TRUE(calls == (std::vector<Transport>{Transport::IB0, Transport::IB1, Transport::IB7, Transport::MRC7}));
   EXPECT_EQ(memory.data(), ptr);
   EXPECT_EQ(memory.size(), size);
   EXPECT_EQ(memory.transports(), transports);
 
   uint64_t hostHash = getHostHash();
   uint64_t pidHash = getPidHash();
-  int8_t transportCount = 3;
+  int8_t transportCount = 4;
   std::vector<char> bytes;
   detail::serialize(bytes, ptr);
   detail::serialize(bytes, size);
@@ -400,4 +514,72 @@ TEST(RdmaProviderTest, LocalResourcesRetainProvider) {
     endpoint = Endpoint();
     EXPECT_TRUE(provider.expired());
   }
+}
+
+TEST(RdmaProviderTest, NativeMrcHostModesAndResourceLifetime) {
+#if defined(MSCCLPP_USE_MRC)
+  if (!std::getenv("MSCCLPP_TEST_NATIVE_MRC")) {
+    SKIP_TEST() << "Set MSCCLPP_TEST_NATIVE_MRC to opt in to native MRC resource tests";
+  }
+  using namespace mscclpp;
+  MSCCLPP_CUDATHROW(cudaSetDevice(0));
+  for (auto mode :
+       {EndpointConfig::Ib::Mode::Default, EndpointConfig::Ib::Mode::Host, EndpointConfig::Ib::Mode::HostNoAtomic}) {
+    std::array<uint64_t, 8> buffer{};
+    auto context = Context::create();
+    EndpointConfig config(Transport::MRC0, DeviceType::CPU);
+    config.ib.mode = mode;
+    config.ib.gidIndex = 3;
+    config.ib.maxCqSize = config.ib.maxCqPollNum = config.ib.maxRecvWr = 8;
+    config.ib.maxSendWr = 16;
+    config.ib.maxWrPerSend = 4;
+    auto endpoint = context->createEndpoint(config);
+    auto native = dynamic_cast<const MrcEndpoint*>(RdmaTestAccess::getImpl(endpoint).rdmaEndpoint_.get());
+    ASSERT_NE(native, nullptr);
+    EXPECT_TRUE(native->noAtomic());
+    EXPECT_FALSE(native->context().supportsRdmaAtomics());
+    try {
+      native->qp()->stageSendAtomicAdd(nullptr, IbMrInfo{}, 0, 0, 1, true);
+      FAIL() << "Native MRC must reject network atomics before staging a WR";
+    } catch (const Error& error) {
+      EXPECT_TRUE(error.getErrorCode() == ErrorCode::InvalidUsage);
+      EXPECT_TRUE(std::string(error.what()).find("Native MRC does not support network atomics") != std::string::npos);
+    }
+    auto memory = context->registerMemory(buffer.data(), sizeof(buffer), Transport::MRC0);
+    std::weak_ptr<RdmaProvider> provider = RdmaTestAccess::getImpl(*context).rdmaProviders_.at(Transport::MRC0);
+    context.reset();
+    EXPECT_FALSE(provider.expired());
+    if (mode == EndpointConfig::Ib::Mode::Host)
+      endpoint = Endpoint();
+    else
+      memory = RegisteredMemory();
+    EXPECT_FALSE(provider.expired());
+    endpoint = Endpoint();
+    memory = RegisteredMemory();
+    EXPECT_TRUE(provider.expired());
+  }
+#else
+  SKIP_TEST() << "Native MRC support is not enabled";
+#endif
+}
+
+TEST(RdmaProviderTest, NativeMrcDeviceModeRejected) {
+#if defined(MSCCLPP_USE_MRC)
+  if (!std::getenv("MSCCLPP_TEST_NATIVE_MRC")) {
+    SKIP_TEST() << "Set MSCCLPP_TEST_NATIVE_MRC to opt in to native MRC resource tests";
+  }
+  using namespace mscclpp;
+  auto context = Context::create();
+  EndpointConfig config(Transport::MRC0, DeviceType::CPU);
+  config.ib.mode = EndpointConfig::Ib::Mode::Device;
+  try {
+    context->createEndpoint(config);
+    FAIL() << "Native MRC must not use the IB GPUNetIO implementation";
+  } catch (const Error& error) {
+    EXPECT_TRUE(error.getErrorCode() == ErrorCode::InvalidUsage);
+    EXPECT_TRUE(std::string(error.what()).find("Native MRC does not support Device mode") != std::string::npos);
+  }
+#else
+  SKIP_TEST() << "Native MRC support is not enabled";
+#endif
 }

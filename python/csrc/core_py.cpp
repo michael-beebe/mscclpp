@@ -114,6 +114,14 @@ void register_core(nb::module_& m) {
       .value("IB5", Transport::IB5)
       .value("IB6", Transport::IB6)
       .value("IB7", Transport::IB7)
+      .value("MRC0", Transport::MRC0)
+      .value("MRC1", Transport::MRC1)
+      .value("MRC2", Transport::MRC2)
+      .value("MRC3", Transport::MRC3)
+      .value("MRC4", Transport::MRC4)
+      .value("MRC5", Transport::MRC5)
+      .value("MRC6", Transport::MRC6)
+      .value("MRC7", Transport::MRC7)
       .value("NumTransports", Transport::NumTransports);
 
   nb::class_<TransportFlags>(m, "CppTransportFlags")

@@ -1,9 +1,10 @@
 // Copyright (c) Microsoft Corporation.
-// Licensed under the MIT license.
+// Licensed under the MIT License.
 
 #ifndef MSCCLPP_ENV_HPP_
 #define MSCCLPP_ENV_HPP_
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -119,6 +120,25 @@ class Env {
   /// Env name: `MSCCLPP_IB_GID_INDEX`. The GID index to use for IB transport.
   /// Default is 0. Used when `EndpointConfig::Ib::gidIndex` is -1 (unspecified).
   const int ibGidIndex;
+
+  /// Env name: `MSCCLPP_MRC_QP_HINT_ENABLE`. Create and attach a hint to each native MRC QP.
+  /// Allowed values: 0 (default) or 1. Does not affect IB or IB-over-shim QPs.
+  /// Each connection currently owns one QP and advertises one QP per peer and one sending peer.
+  const bool mrcQpHintEnable;
+
+  /// Env name: `MSCCLPP_MRC_CC_INIT_RATE`. Native MRC initial CC rate per QP, in provider-specific units.
+  /// Default is 0. Read only when MRC QP hints are enabled; must fit uint32_t and be nonnegative.
+  /// All-zero CC rates leave the vendor payload zero, preserving provider defaults.
+  const int64_t mrcCcInitRate;
+
+  /// Env name: `MSCCLPP_MRC_CC_MIN_RATE`. Native MRC connection-wide minimum CC rate, in provider-specific units.
+  /// Default is 0. Divided by the connection's QP count (currently one), with integer truncation.
+  /// Read only when MRC QP hints are enabled; the effective per-QP rate must fit uint32_t and be nonnegative.
+  const int64_t mrcCcMinRate;
+
+  /// Env name: `MSCCLPP_MRC_CC_MAX_RATE`. Native MRC maximum CC rate per QP, in provider-specific units.
+  /// Default is 0. Read only when MRC QP hints are enabled; must fit uint32_t and be nonnegative.
+  const int64_t mrcCcMaxRate;
 
  private:
   Env();

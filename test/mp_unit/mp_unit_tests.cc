@@ -24,6 +24,11 @@ int rankToNode(int rank) {
 }
 
 mscclpp::Transport ibIdToTransport(int id) {
+  if (id < 0 || id >= 8) throw std::runtime_error("RDMA device index must be in [0, 7]");
+  const auto backend = gEnv->args.at("rdma_backend");
+  if (backend == "mrc") {
+    return static_cast<mscclpp::Transport>(static_cast<int>(mscclpp::Transport::MRC0) + id);
+  }
   mscclpp::Transport IBs[] = {mscclpp::Transport::IB0, mscclpp::Transport::IB1, mscclpp::Transport::IB2,
                               mscclpp::Transport::IB3, mscclpp::Transport::IB4, mscclpp::Transport::IB5,
                               mscclpp::Transport::IB6, mscclpp::Transport::IB7};
@@ -39,6 +44,7 @@ static std::unordered_map<std::string, std::string> parseArgs(int argc, const ch
        << "Options:\n"
        << "  --ip_port=<ip>:<port>    IP and port for MPI to connect to. Default: " << gDefaultIpPort << "\n"
        << "  --ib_gid_index=<index>   InfiniBand GID index. Default: 0\n"
+       << "  --rdma_backend=ib|mrc   Select IB (default) or native MRC transports.\n"
        << "  -h                       Show this help message and exit.\n";
     std::cout << ss.str();
   };
@@ -48,6 +54,7 @@ static std::unordered_map<std::string, std::string> parseArgs(int argc, const ch
   // Default values
   options["ip_port"] = gDefaultIpPort;
   options["ib_gid_index"] = "0";
+  options["rdma_backend"] = "ib";
 
   auto setKV = [&](const std::string& k, const std::string& v) {
     if (!k.empty()) options[k] = v;
@@ -122,6 +129,9 @@ void MultiProcessTestEnv::SetUp() {
 
   // parse the command line arguments
   args = parseArgs(argc, argv);
+  if (args.at("rdma_backend") != "ib" && args.at("rdma_backend") != "mrc") {
+    throw std::runtime_error("--rdma_backend must be ib or mrc");
+  }
 }
 
 void MultiProcessTestEnv::TearDown() { MPI_Finalize(); }

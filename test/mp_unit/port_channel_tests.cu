@@ -1028,7 +1028,9 @@ TEST(PortChannelOneToOneTest, AccumulateEthernetRejectsInvalidTargets) {
 TEST(PortChannelOneToOneTest, AccumulateIbHostNoAtomicRejected) {
   REQUIRE_IBVERBS;
   requireGdrForHostNoAtomicCollective(/*firstRank=*/0, /*secondRank=*/1);
-  testAccumulateRejected(ibTransport, IbMode::HostNoAtomic, /*tag=*/77, "not supported in IB no-atomic mode",
+  const char* expected = mscclpp::AllMRCTransports.has(ibTransport) ? "not supported in MRC no-atomic mode"
+                                                                    : "not supported in IB no-atomic mode";
+  testAccumulateRejected(ibTransport, IbMode::HostNoAtomic, /*tag=*/77, expected,
                          /*checkHugeOffset=*/true);
 }
 

@@ -72,7 +72,8 @@ doca_verbs_mtu_size docaMtu(int mtu) {
 
 }  // namespace
 
-GpuNetIoDevice& IbCtx::gpuNetIoDevice() {
+template <>
+GpuNetIoDevice& VerbsCtx<Ib>::gpuNetIoDevice() {
   if (!gpuNetIoDevice_) gpuNetIoDevice_ = std::make_unique<GpuNetIoDevice>(*this);
   return *gpuNetIoDevice_;
 }

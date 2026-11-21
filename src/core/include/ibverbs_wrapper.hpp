@@ -10,7 +10,8 @@
 
 namespace mscclpp {
 
-struct IBVerbs {
+template <bool Native>
+struct VerbsLib {
  private:
   static void* dlsym(const std::string& symbol, bool allowReturnNull = false);
 
@@ -20,7 +21,7 @@ struct IBVerbs {
   static inline auto(name__)(Args && ... args) {                                             \
     static_assert(sizeof(&::func__) > 0, #func__ " is expected be a function, not a macro"); \
     static decltype(&::func__) impl = nullptr;                                               \
-    if (!impl) impl = reinterpret_cast<decltype(impl)>(IBVerbs::dlsym(#func__));             \
+    if (!impl) impl = reinterpret_cast<decltype(impl)>(VerbsLib::dlsym(#func__));            \
     return impl(std::forward<Args>(args)...);                                                \
   }
 
@@ -60,8 +61,8 @@ struct IBVerbs {
   static inline struct ibv_device** ibv_get_device_list(int* num_devices) {
     using FuncType = struct ibv_device** (*)(int*);
     static FuncType impl = nullptr;
-    if (!impl) impl = reinterpret_cast<FuncType>(IBVerbs::dlsym("ibv_get_device_list"));
-    IBVerbs::ibv_static_providers(NULL, _RDMA_STATIC_PREFIX(RDMA_STATIC_PROVIDERS), NULL);
+    if (!impl) impl = reinterpret_cast<FuncType>(VerbsLib::dlsym("ibv_get_device_list"));
+    VerbsLib::ibv_static_providers(NULL, _RDMA_STATIC_PREFIX(RDMA_STATIC_PROVIDERS), NULL);
     return impl(num_devices);
   }
 #endif  // defined(ibv_get_device_list)
@@ -69,7 +70,7 @@ struct IBVerbs {
 #undef ibv_query_port
   static inline int ibv_query_port(struct ibv_context* context, uint8_t port_num, struct ibv_port_attr* port_attr) {
     static decltype(&::ibv_query_port) impl = nullptr;
-    if (!impl) impl = reinterpret_cast<decltype(impl)>(IBVerbs::dlsym("ibv_query_port"));
+    if (!impl) impl = reinterpret_cast<decltype(impl)>(VerbsLib::dlsym("ibv_query_port"));
     struct verbs_context* vctx = verbs_get_ctx_op(context, query_port);
     if (!vctx) {
       int rc;
@@ -86,10 +87,10 @@ struct IBVerbs {
     static decltype(&::ibv_reg_mr_iova2) impl_iova2 = nullptr;
     int is_access_const = __builtin_constant_p(((int)(access)&IBV_ACCESS_OPTIONAL_RANGE) == 0);
     if (is_access_const && (access & IBV_ACCESS_OPTIONAL_RANGE) == 0) {
-      if (!impl) impl = reinterpret_cast<decltype(impl)>(IBVerbs::dlsym("ibv_reg_mr"));
+      if (!impl) impl = reinterpret_cast<decltype(impl)>(VerbsLib::dlsym("ibv_reg_mr"));
       return impl(pd, addr, length, (int)access);
     } else {
-      if (!impl_iova2) impl_iova2 = reinterpret_cast<decltype(impl_iova2)>(IBVerbs::dlsym("ibv_reg_mr_iova2"));
+      if (!impl_iova2) impl_iova2 = reinterpret_cast<decltype(impl_iova2)>(VerbsLib::dlsym("ibv_reg_mr_iova2"));
       return impl_iova2(pd, addr, length, (uintptr_t)addr, access);
     }
   }
@@ -110,6 +111,9 @@ struct IBVerbs {
     return cq->context->ops.poll_cq(cq, num_entries, wc);
   }
 };
+
+using IBVerbs = VerbsLib<false>;
+using NativeIBVerbs = VerbsLib<true>;
 
 }  // namespace mscclpp
 
